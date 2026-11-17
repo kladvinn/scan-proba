@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '12'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
+  var APP_VERSION = '13'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
@@ -355,6 +355,8 @@
   function canReloadNow() {
     if (!updateTarget || wiping || reloading) return false;
     if (!$('modal').hidden) return false; // відкрите «Стерти все?» — спершу хай людина відповість
+    var a = document.activeElement;        // людина саме друкує (номер, модель, «що було не так») — не збивати
+    if (a && /^(INPUT|TEXTAREA)$/.test(a.tagName)) return false;
     if (current === 'scan' || current === 'photo') return false;
     if (current === 'code') {
       if (entry.mode === 'pin-repeat') return false;          // перший PIN уже набрано
@@ -398,23 +400,23 @@
   function installNewWorker() {
     var sw = navigator.serviceWorker;
     if (!sw || !sw.controller) return Promise.resolve();
-    return sw.getRegistration().then(function (reg) {
-      if (!reg) return;
-      return new Promise(function (resolve) {
-        var done = false;
-        function finish() {
-          if (done) return;
-          done = true;
-          sw.removeEventListener('controllerchange', finish);
-          resolve();
-        }
-        sw.addEventListener('controllerchange', finish);
-        setTimeout(finish, 20000);
-        reg.update().then(function () {
+    return new Promise(function (resolve) {
+      var done = false;
+      function finish() {
+        if (done) return;
+        done = true;
+        sw.removeEventListener('controllerchange', finish);
+        resolve();
+      }
+      sw.addEventListener('controllerchange', finish);
+      setTimeout(finish, 20000); // на все разом — навіть якщо телефон не відповість на getRegistration
+      sw.getRegistration().then(function (reg) {
+        if (!reg) return finish();
+        return reg.update().then(function () {
           if (!reg.installing && !reg.waiting) finish(); // sw.js не змінився — чекати нічого
         }, finish);
-      });
-    }).catch(function () { /* */ });
+      }).catch(finish);
+    });
   }
   function go(name) {
     history.pushState({ s: name }, '', '#' + name);

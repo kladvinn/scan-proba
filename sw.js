@@ -8,11 +8,11 @@
 // - сама сторінка лягає в копію ЛИШЕ під час установлення обробника, разом зі своїми файлами (SHELL).
 //   Відповіді з мережі в копію не кладемо: інакше в копії могла б опинитись нова сторінка без своїх
 //   файлів, і без мережі вона б не завантажилась. Нова версія = новий sw.js = новий повний набір.
-var CACHE = 'scan-proba-v14';
+var CACHE = 'scan-proba-v15';
 var SHELL = [
   './',
-  'style.css?v=12',
-  'app.js?v=12',
+  'style.css?v=13',
+  'app.js?v=13',
   'manifest.webmanifest',
   'vendor/zxing-wasm/zxing-reader.iife.js',
   'vendor/zxing-wasm/zxing_reader.wasm',
@@ -21,10 +21,29 @@ var SHELL = [
   'icons/apple-touch-icon.png'
 ];
 var STATIC = /\/(vendor|icons|test-codes)\//;
+// номер випуску цього набору — з адреси app.js у SHELL (щоб не тримати його ще в одному місці)
+var V = (function () {
+  for (var i = 0; i < SHELL.length; i++) { var m = /^app\.js\?v=(\d+)$/.exec(SHELL[i]); if (m) return m[1]; }
+  return '';
+})();
 
+// Установлення: увесь набір в одну нову копію. GitHub Pages не зважає на ?v= і віддає те, що опубліковано
+// саме зараз, тож посеред публікації сторінка й app.js можуть прийти з різних випусків. Тому після
+// завантаження звіряємо: сторінка посилається на app.js?v=V, а сам app.js — версії V. Не збіглось —
+// копію стираємо й не ставимося: лишається попередній обробник зі своїм цілим набором, телефон спробує пізніше.
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(CACHE).then(function (c) {
-    return c.addAll(SHELL.map(function (u) { return new Request(u, { cache: 'reload' }); }));
+    return c.addAll(SHELL.map(function (u) { return new Request(u, { cache: 'reload' }); })).then(function () {
+      return Promise.all([c.match('./'), c.match('app.js?v=' + V)]);
+    }).then(function (rs) {
+      return Promise.all(rs.map(function (r) { return r ? r.text() : ''; }));
+    }).then(function (t) {
+      var pageOk = V && new RegExp('app\\.js\\?v=' + V + '\\b').test(t[0]);
+      var appOk = V && t[1].indexOf("APP_VERSION = '" + V + "'") >= 0;
+      if (!pageOk || !appOk) {
+        return caches.delete(CACHE).then(function () { throw new Error('набір з різних випусків'); });
+      }
+    });
   }).then(function () { return self.skipWaiting(); }));
 });
 
