@@ -8,11 +8,11 @@
 // - сама сторінка лягає в копію ЛИШЕ під час установлення обробника, разом зі своїми файлами (SHELL).
 //   Відповіді з мережі в копію не кладемо: інакше в копії могла б опинитись нова сторінка без своїх
 //   файлів, і без мережі вона б не завантажилась. Нова версія = новий sw.js = новий повний набір.
-var CACHE = 'scan-proba-v13';
+var CACHE = 'scan-proba-v14';
 var SHELL = [
   './',
-  'style.css?v=11',
-  'app.js?v=11',
+  'style.css?v=12',
+  'app.js?v=12',
   'manifest.webmanifest',
   'vendor/zxing-wasm/zxing-reader.iife.js',
   'vendor/zxing-wasm/zxing_reader.wasm',
