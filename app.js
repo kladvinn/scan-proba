@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '10'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
+  var APP_VERSION = '11'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
