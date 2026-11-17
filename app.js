@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '3'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js
+  var APP_VERSION = '4'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
@@ -423,8 +423,10 @@
     if (entry.value.length) $('code-err').textContent = '';
     renderDots();
     if (entry.value.length === entry.len) {
+      // Код і перший PIN перемикають екран одразу, без паузи: інакше швидкий дотик одразу після
+      // останньої цифри губився б. Пауза (busy) — лише поки перевіряється або записується PIN.
       busy = true;
-      setTimeout(function () { submitEntry().then(function () { busy = false; }, function (e) { busy = false; $('code-err').textContent = 'Помилка: ' + (e && e.message ? e.message : e); }); }, 150);
+      submitEntry().then(function () { busy = false; }, function (e) { busy = false; $('code-err').textContent = 'Помилка: ' + (e && e.message ? e.message : e); });
     }
   }
   function submitEntry() {
