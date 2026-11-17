@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '4'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js
+  var APP_VERSION = '5'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
@@ -321,6 +321,39 @@
       // позначки перечитати: на старті IndexedDB могла не відповісти вчасно
       readMarks().then(function (m) { marks = m; if (current === 'report') $('report-text').value = buildReport(); });
     }
+    if (updateTarget) applyUpdate(); // нова версія чекала, поки людина вийде зі сканера чи фото
+  }
+
+  // ---------------------------------------------------------------- оновлення сторінки
+  // iPhone тримає програму з іконки в памʼяті, і тоді вона не перезавантажується сама. Тому при кожному
+  // поверненні на сторінку вона питає version.json (повз кеші). Якщо там новіша версія — перезавантажується,
+  // але лише там, де нічого не губиться: не під час сканування чи фото і не посеред набору коду.
+  // Позначки й список зчитувань лежать у сховищах телефона, тож перезавантаження їх не чіпає.
+  var updateTarget = null;
+  var lastUpdateCheck = 0;
+  function checkForUpdate() {
+    var now = Date.now();
+    if (now - lastUpdateCheck < 5000) return;
+    lastUpdateCheck = now;
+    if (!window.fetch) return;
+    fetch('version.json', { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+      var v = j && Number(j.v);
+      if (!v || v <= Number(APP_VERSION)) return;
+      updateTarget = v;
+      applyUpdate();
+    }, function () { /* без мережі — лишаємось на збереженій версії */ });
+  }
+  function applyUpdate() {
+    if (!updateTarget || wiping) return;
+    if (current === 'scan' || current === 'photo') return;
+    if (current === 'code' && entry.value.length) return;
+    // на слабкому звʼязку сторінка може знову прийти зі старої копії — не крутитись у петлі
+    var tried = null;
+    try { tried = sessionStorage.getItem(KEY + '.reloaded-for'); } catch (e) { /* */ }
+    if (tried === String(updateTarget)) return;
+    try { sessionStorage.setItem(KEY + '.reloaded-for', String(updateTarget)); } catch (e) { /* */ }
+    saveSession();
+    location.reload();
   }
   function go(name) {
     history.pushState({ s: name }, '', '#' + name);
@@ -592,11 +625,12 @@
       var tail2 = '\n\nПотім поверніться сюди й натисніть «Спробувати ще раз». Номер можна ввести руками нижче.';
       var fromIcon = openedFrom() === 'icon';
       if (IS_IOS) {
+        // назви пунктів звірено на iPhone з iOS 26.5 українською (блок П3а)
         return 'Камеру не дозволено.\n\n' + (fromIcon ?
-          'Що зробити: закрийте сторінку (змахніть її вгору в перемикачі програм) і відкрийте знову з іконки — iPhone спитає ще раз, натисніть «Дозволити».\n' +
-          'Якщо не питає: «Параметри» → «Програми» → «Safari» → «Камера» → «Запитувати» (на старіших iPhone: «Параметри» → «Safari» → «Камера»).' :
-          'Що натиснути: «Параметри» → «Програми» → «Safari» → «Камера» → «Дозволити» (на старіших iPhone: «Параметри» → «Safari» → «Камера»).\n' +
-          'Або в Safari: кнопка ліворуч від адреси («аА» або значок сторінки) → «Параметри вебсайту» → «Камера» → «Дозволити».') + tail2;
+          'Що зробити: «Параметри» → «Програми» → «Safari» → «Камера» → «Питати» або «Дозволити».\n' +
+          'Потім закрийте «Пробу» повністю (змахніть її вгору в перемикачі програм) і відкрийте знову з іконки.' :
+          'Що натиснути в Safari: кнопка ліворуч від адреси → «⋯» → унизу, у «Параметри вебсайту для ' + location.host + '», рядок «Камера» → «Дозволити».\n' +
+          'Або: «Параметри» → «Програми» → «Safari» → «Камера» → «Дозволити».') + tail2;
       }
       return 'Камеру не дозволено.\n\n' + (fromIcon ?
         'Що натиснути: утримуйте іконку «Проба» → «Про застосунок» (ⓘ) → «Дозволи» → «Камера» → «Дозволити».\n' :
@@ -972,6 +1006,7 @@
       if (current === 'scan') stopScanner();
       saveSession();
     } else {
+      checkForUpdate();
       if (current === 'scan' && unlocked) startScanner();
       // повернулись із камери телефона без знімка (скасували) — позначку «фото в дорозі» прибрати
       if (photoPicking) setTimeout(function () { if (photoPicking) photoPendingClear(); }, 3000);
@@ -1307,6 +1342,7 @@
       else if (pinMark) setEntry('pin');
       else { pinOnly = true; setEntry('pin-new'); }
       registerSW();
+      checkForUpdate();
     }).catch(function (e) {
       $('boot-msg').textContent = 'Помилка запуску: ' + (e && e.message ? e.message : e);
     });
