@@ -355,7 +355,18 @@
       else { b.textContent = k; b.dataset.k = k; }
       kp.appendChild(b);
     });
+    // Натискання — у мить дотику: швидкі повторні дотики до тієї ж цифри (1111) iPhone інакше може злити в один «клік».
+    // «click» лишається для клавіатури й читачів екрана, але після дотику ігнорується.
+    var lastPointer = 0;
+    kp.addEventListener('pointerdown', function (e) {
+      var t = e.target.closest('button');
+      if (!t || !t.dataset.k) return;
+      e.preventDefault();
+      lastPointer = Date.now();
+      press(t.dataset.k);
+    });
     kp.addEventListener('click', function (e) {
+      if (Date.now() - lastPointer < 800) return;
       var t = e.target.closest('button');
       if (t && t.dataset.k) press(t.dataset.k);
     });
