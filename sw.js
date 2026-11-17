@@ -1,14 +1,15 @@
 'use strict';
 // Офлайн-запас. Працює лише з файлами цієї ж сторінки; на інші адреси не звертається.
-// - бібліотека, значки й тестові коди: спершу збережена копія (вони не змінюються без зміни CACHE);
-// - сама сторінка (html, js, css, маніфест): спершу мережа, повз HTTP-кеш браузера, але не довше 3 с —
-//   далі збережена копія, щоб на слабкому звʼязку сторінка не висіла порожньою.
-var CACHE = 'scan-proba-v2';
+// - сама сторінка (перехід на неї): спершу мережа, але не довше 3 с — далі збережена копія,
+//   щоб на слабкому звʼязку сторінка не висіла порожньою;
+// - файли з номером версії в адресі (app.js?v=1, style.css?v=1), бібліотека, значки, тестові коди:
+//   спершу збережена копія. Нова версія сторінки посилається на нові адреси (?v=2), тож стара сторінка
+//   завжди отримує свої старі файли, а нова — нові: версії не змішуються.
+var CACHE = 'scan-proba-v3';
 var SHELL = [
   './',
-  'index.html',
-  'style.css',
-  'app.js',
+  'style.css?v=1',
+  'app.js?v=1',
   'manifest.webmanifest',
   'vendor/zxing-wasm/zxing-reader.iife.js',
   'vendor/zxing-wasm/zxing_reader.wasm',
@@ -31,11 +32,38 @@ self.addEventListener('activate', function (e) {
 });
 
 function put(req, res) {
-  if (res && res.ok && res.type === 'basic') {
+  if (res && res.ok && res.type === 'basic' && !res.redirected) {
     var copy = res.clone();
     caches.open(CACHE).then(function (c) { return c.put(req, copy); });
   }
   return res;
+}
+
+// мережа з запасом: якщо мережа не відповіла за ms — копія (якщо є); якщо мережа впала — копія або помилка
+function networkFirst(req, fallbackKey, ms) {
+  var fresh = fetch(req).then(function (res) { return put(req, res); });
+  function fromCache() {
+    return caches.match(req, { ignoreSearch: true }).then(function (r) {
+      return r || (fallbackKey ? caches.match(fallbackKey) : null);
+    }).catch(function () { return null; });
+  }
+  return new Promise(function (resolve, reject) {
+    var done = false;
+    var timer = setTimeout(function () {
+      fromCache().then(function (r) { if (r && !done) { done = true; resolve(r); } });
+    }, ms);
+    fresh.then(function (res) {
+      clearTimeout(timer);
+      if (!done) { done = true; resolve(res); }
+    }, function (err) {
+      clearTimeout(timer);
+      fromCache().then(function (r) {
+        if (done) return;
+        done = true;
+        if (r) resolve(r); else reject(err);
+      });
+    });
+  });
 }
 
 self.addEventListener('fetch', function (e) {
@@ -43,37 +71,15 @@ self.addEventListener('fetch', function (e) {
   var url = new URL(req.url);
   if (req.method !== 'GET' || url.origin !== self.location.origin) return;
 
-  if (STATIC.test(url.pathname)) {
+  if (req.mode === 'navigate') {
+    e.respondWith(networkFirst(req, './', 3000));
+    return;
+  }
+  if (STATIC.test(url.pathname) || /(^|&)v=/.test(url.search.slice(1))) {
     e.respondWith(caches.match(req).then(function (hit) {
       return hit || fetch(req).then(function (res) { return put(req, res); });
     }));
     return;
   }
-
-  // свіжа сторінка з мережі (без HTTP-кешу, щоб після оновлення не змішались версії файлів)
-  var fresh = fetch(new Request(url.href, { cache: 'no-cache', credentials: 'same-origin' })).then(function (res) { return put(req, res); });
-  e.respondWith(new Promise(function (resolve, reject) {
-    var done = false;
-    function fromCache() {
-      return caches.match(req, { ignoreSearch: true }).then(function (r) {
-        if (r) return r;
-        if (req.mode === 'navigate') return caches.match('./');
-        return null;
-      });
-    }
-    var timer = setTimeout(function () {
-      fromCache().then(function (r) { if (r && !done) { done = true; resolve(r); } });
-    }, 3000);
-    fresh.then(function (res) {
-      clearTimeout(timer);
-      if (!done) { done = true; resolve(res); }
-    }, function () {
-      clearTimeout(timer);
-      fromCache().then(function (r) {
-        if (done) return;
-        done = true;
-        if (r) resolve(r); else reject(new Error('немає мережі й копії'));
-      });
-    });
-  }));
+  e.respondWith(networkFirst(req, null, 3000));
 });

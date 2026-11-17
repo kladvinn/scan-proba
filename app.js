@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '1';
+  var APP_VERSION = '1'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
@@ -736,7 +736,12 @@
   }
   function decodeNative() {
     drawVisible();
-    return withTimeout(native.detector.detect(canvas), 3000, 'вбудоване читання').then(function (out) {
+    // якщо вбудований засіб завис, нових запитів не накопичуємо, поки не відповість попередній
+    sc.nativeBusy = true;
+    var d = native.detector.detect(canvas);
+    var free = function () { sc.nativeBusy = false; };
+    d.then(free, free);
+    return withTimeout(d, 3000, 'вбудоване читання').then(function (out) {
       return out.filter(function (b) { return b.rawValue; }).map(function (b) { return { text: b.rawValue, type: typeLabel(b.format) }; });
     });
   }
@@ -745,7 +750,7 @@
     if (!sc.running || gen !== sc.gen) return;
     var m = mode === 'native' && native.detector ? 'native' : 'lib';
     // кадр готовий і обраний спосіб готовий (бібліотека могла ще вантажитись після перемикання)
-    var ready = video.readyState >= 2 && video.videoWidth > 0 && (m === 'native' || lib.state === 'ready');
+    var ready = video.readyState >= 2 && video.videoWidth > 0 && (m === 'native' ? !sc.nativeBusy : lib.state === 'ready');
     var t0 = performance.now();
     var p = !ready ? Promise.resolve([]) : (m === 'native' ? decodeNative() : decodeLib());
     p.then(function (found) {
@@ -892,8 +897,12 @@
     sc.lastAt = performance.now();
     if (m === 'lib' && lib.state !== 'ready') {
       setScanState('Готую читач кодів…');
-      ensureLib().then(function () { setScanState('Читає бібліотека.'); },
-        function (e) { session.libError = errText(e); saveSession(); setScanState('Не вдалося завантажити читач кодів. Натисніть «Назад» і знову «Сканувати».'); });
+      ensureLib().then(function () { if (mode === 'lib' && current === 'scan') setScanState('Читає бібліотека.'); },
+        function (e) {
+          session.libError = errText(e);
+          saveSession();
+          if (mode === 'lib' && current === 'scan') setScanState('Не вдалося завантажити читач кодів. Натисніть «Назад» і знову «Сканувати».');
+        });
       return;
     }
     setScanState(m === 'native' ? 'Читає вбудований засіб телефона.' : 'Читає бібліотека.');
@@ -1224,6 +1233,9 @@
       if (!v) return;
       if (handleCode(v, '—', 'manual')) inp.value = '';
     });
+    // будь-який дотик до сторінки означає, що камера телефона вже закрита: стару позначку «фото в дорозі» прибрати
+    // (на iPhone камера не ховає сторінку, а подія «cancel» є не всюди)
+    document.addEventListener('pointerdown', function () { if (photoPicking) photoPendingClear(); }, true);
     $('photo-input').addEventListener('click', photoPendingSet);
     $('photo-input').addEventListener('cancel', photoPendingClear);
     $('photo-input').addEventListener('change', onPhoto);
@@ -1265,6 +1277,10 @@
     mode = session.mode === 'native' ? 'native' : 'lib';
     Promise.all([detectDevice(), initNative(), checkPersisted(), readMarks()]).then(function (r) {
       marks = r[3];
+      // cookie з першої редакції сторінки ще могла нести відбиток PIN — переписати без нього
+      if (marks.ck && marks.ck.state === 'ok' && (marks.ck.m.pin || marks.ck.m.salt)) {
+        cookieSet(JSON.stringify({ v: 1, first: marks.ck.m.first, how: marks.ck.m.how }));
+      }
       if (mode === 'native' && native.state !== 'ok') mode = 'lib';
       mark = pickMark(marks);
       pinMark = pickPinMark(marks);
