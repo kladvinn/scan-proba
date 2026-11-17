@@ -5,11 +5,11 @@
 // - файли з номером версії в адресі (app.js?v=1, style.css?v=1), бібліотека, значки, тестові коди:
 //   спершу збережена копія. Нова версія сторінки посилається на нові адреси (?v=2), тож стара сторінка
 //   завжди отримує свої старі файли, а нова — нові: версії не змішуються.
-var CACHE = 'scan-proba-v10';
+var CACHE = 'scan-proba-v11';
 var SHELL = [
   './',
-  'style.css?v=8',
-  'app.js?v=8',
+  'style.css?v=9',
+  'app.js?v=9',
   'manifest.webmanifest',
   'vendor/zxing-wasm/zxing-reader.iife.js',
   'vendor/zxing-wasm/zxing_reader.wasm',
