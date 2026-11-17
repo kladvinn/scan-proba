@@ -5,11 +5,14 @@
 // - файли з номером версії в адресі (app.js?v=1, style.css?v=1), бібліотека, значки, тестові коди:
 //   спершу збережена копія. Нова версія сторінки посилається на нові адреси (?v=2), тож стара сторінка
 //   завжди отримує свої старі файли, а нова — нові: версії не змішуються.
-var CACHE = 'scan-proba-v11';
+// - сама сторінка лягає в копію ЛИШЕ під час установлення обробника, разом зі своїми файлами (SHELL).
+//   Відповіді з мережі в копію не кладемо: інакше в копії могла б опинитись нова сторінка без своїх
+//   файлів, і без мережі вона б не завантажилась. Нова версія = новий sw.js = новий повний набір.
+var CACHE = 'scan-proba-v12';
 var SHELL = [
   './',
-  'style.css?v=9',
-  'app.js?v=9',
+  'style.css?v=10',
+  'app.js?v=10',
   'manifest.webmanifest',
   'vendor/zxing-wasm/zxing-reader.iife.js',
   'vendor/zxing-wasm/zxing_reader.wasm',
@@ -42,9 +45,10 @@ function put(req, res) {
 // мережа з запасом: якщо мережа не відповіла за ms — копія (якщо є); якщо мережа впала — копія або помилка
 // Мережу питаємо повз HTTP-кеш браузера (GitHub Pages дозволяє тримати сторінку 10 хв), щоб після
 // оновлення з іконки відкривалась свіжа версія. Переадресацію не розгортаємо — віддаємо браузерові як є.
+// Відповідь мережі в копію не кладемо (див. угорі).
 function networkFirst(req, fallbackKey, ms) {
   var net = new Request(req.url, { cache: 'no-cache', credentials: 'same-origin', redirect: 'manual' });
-  var fresh = fetch(net).then(function (res) { return put(req, res); });
+  var fresh = fetch(net);
   function fromCache() {
     return caches.match(req, { ignoreSearch: true }).then(function (r) {
       return r || (fallbackKey ? caches.match(fallbackKey) : null);

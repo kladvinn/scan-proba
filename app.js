@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '9'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
+  var APP_VERSION = '10'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
@@ -312,7 +312,7 @@
     if (reloading) return; // сторінка вже перезавантажується на нову версію — нічого не відкривати
     var prev = current;
     if (prev === 'scan' && name !== 'scan') stopScanner();
-    if (prev === 'photo' && name !== 'photo') clearPhoto();
+    if (prev === 'photo' && name !== 'photo') { clearPhoto(); photoPendingClear(); } // з екрана фото не піти, поки відкрита камера
     show(name);
     if (name === 'main') renderMain();
     if (name === 'scan') { renderReads(); renderMode(); startScanner(); }
@@ -330,12 +330,14 @@
   // поверненні на сторінку вона питає version.json (повз кеші). Якщо там новіша версія — перезавантажується,
   // але лише там, де нічого не губиться: не під час сканування чи фото і не посеред набору коду.
   // Позначки й список зчитувань лежать у сховищах телефона, тож перезавантаження їх не чіпає.
-  // Перед перезавантаженням сторінка сама забирає нову index.html і перевіряє в ній номер версії: так нова
-  // версія лягає в офлайн-копію, і перезавантаження не відкриє стару навіть на слабкому звʼязку.
+  // Офлайн-копію оновлює лише новий обробник (sw.js) і лише цілим набором: сторінка разом з її файлами.
+  // Тому перед перезавантаженням сторінка просить телефон поставити новий обробник, чекає, поки він
+  // покладе новий набір у копію, і перевіряє, що сторінка, яку віддасть перезавантаження, справді нова.
+  // Не вийшло (слабкий звʼязок, немає мережі) — лишаємось на старій версії й пробуємо при наступному поверненні.
   var updateTarget = null;
   var lastUpdateCheck = 0;
   var reloading = false;   // перезавантаження вже йде
-  var updateBusy = false;  // нова index.html ще завантажується
+  var updateBusy = false;  // новий набір ще завантажується
   var RELOAD_KEY = KEY + '.reloaded-for';
   function checkForUpdate() {
     var now = Date.now();
@@ -352,6 +354,7 @@
   // чи можна перезавантажити зараз, нічого не загубивши
   function canReloadNow() {
     if (!updateTarget || wiping || reloading) return false;
+    if (!$('modal').hidden) return false; // відкрите «Стерти все?» — спершу хай людина відповість
     if (current === 'scan' || current === 'photo') return false;
     if (current === 'code') {
       if (entry.mode === 'pin-repeat') return false;          // перший PIN уже набрано
@@ -372,18 +375,46 @@
     if (same && (g.n >= 3 || Date.now() - g.t < 60000)) return;
     var target = updateTarget;
     updateBusy = true;
-    fetch('./', { cache: 'no-store' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
+    installNewWorker().then(function () {
+      return fetch('./', { cache: 'no-store' });
+    }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
       updateBusy = false;
-      // нова index.html ще не доїхала (або прийшла стара копія) — спробуємо при наступному поверненні
+      // нова сторінка ще не доїхала (або прийшла стара копія) — спробуємо при наступному поверненні
       if (!new RegExp('app\\.js\\?v=' + target + '\\b').test(html)) return;
       if (!canReloadNow() || updateTarget !== target) return;
       try { sessionStorage.setItem(RELOAD_KEY, JSON.stringify({ v: target, t: Date.now(), n: (same ? (g.n || 0) : 0) + 1 })); } catch (e) { /* */ }
       reloading = true;
       saveSession();
+      var back = current;
       show('boot');
       $('boot-msg').textContent = 'Оновлюю сторінку…';
+      // якщо перезавантаження скасували (жест «назад» під час нього) — не лишати людину на цьому екрані
+      setTimeout(function () { reloading = false; show(back); }, 15000);
       location.reload();
     }, function () { updateBusy = false; /* без мережі — лишаємось на збереженій версії */ });
+  }
+  // Просить телефон перевірити sw.js; якщо там новий обробник — чекає, поки він установиться (покладе
+  // в копію новий набір) і почне обслуговувати сторінку. Не довше 20 с.
+  function installNewWorker() {
+    var sw = navigator.serviceWorker;
+    if (!sw || !sw.controller) return Promise.resolve();
+    return sw.getRegistration().then(function (reg) {
+      if (!reg) return;
+      return new Promise(function (resolve) {
+        var done = false;
+        function finish() {
+          if (done) return;
+          done = true;
+          sw.removeEventListener('controllerchange', finish);
+          resolve();
+        }
+        sw.addEventListener('controllerchange', finish);
+        setTimeout(finish, 20000);
+        reg.update().then(function () {
+          if (!reg.installing && !reg.waiting) finish(); // sw.js не змінився — чекати нічого
+        }, finish);
+      });
+    }).catch(function () { /* */ });
   }
   function go(name) {
     history.pushState({ s: name }, '', '#' + name);
