@@ -40,8 +40,11 @@ function put(req, res) {
 }
 
 // мережа з запасом: якщо мережа не відповіла за ms — копія (якщо є); якщо мережа впала — копія або помилка
+// Мережу питаємо повз HTTP-кеш браузера (GitHub Pages дозволяє тримати сторінку 10 хв), щоб після
+// оновлення з іконки відкривалась свіжа версія. Переадресацію не розгортаємо — віддаємо браузерові як є.
 function networkFirst(req, fallbackKey, ms) {
-  var fresh = fetch(req).then(function (res) { return put(req, res); });
+  var net = new Request(req.url, { cache: 'no-cache', credentials: 'same-origin', redirect: 'manual' });
+  var fresh = fetch(net).then(function (res) { return put(req, res); });
   function fromCache() {
     return caches.match(req, { ignoreSearch: true }).then(function (r) {
       return r || (fallbackKey ? caches.match(fallbackKey) : null);
