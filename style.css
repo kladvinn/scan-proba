@@ -52,6 +52,7 @@ h1 { font-size: 26px; margin: 8px 0 12px; }
 h2 { font-size: 24px; margin: 8px 0 8px; }
 p { margin: 8px 0; }
 .lead { font-size: 22px; font-weight: 600; margin-top: 20px; }
+#code-hint { min-height: 2.8em; } /* щоб клавіатура не стрибала між екранами */
 .hint { color: var(--muted); font-size: 16px; }
 .muted { color: var(--muted); }
 .small { font-size: 14px; }
@@ -155,7 +156,7 @@ button:active, .big:active, .mid:active { filter: brightness(0.92); }
 .viewer video { width: 100%; height: 100%; object-fit: cover; display: block; }
 .frame {
   position: absolute;
-  inset: 22% 7%;
+  top: 16%; right: 6%; bottom: 16%; left: 6%;
   border: 3px solid rgba(255, 255, 255, 0.75);
   border-radius: 12px;
   pointer-events: none;
@@ -182,10 +183,10 @@ button:active, .big:active, .mid:active { filter: brightness(0.92); }
 .toast.dup { background: rgba(160, 98, 0, 0.92); }
 .cam-msg {
   position: absolute;
-  inset: 0;
+  top: 0; right: 0; bottom: 0; left: 0;
   overflow-y: auto;
   padding: 16px;
-  background: rgba(10, 18, 24, 0.94);
+  background: #0a1218;
   color: #fff;
   font-size: 17px;
 }
@@ -247,13 +248,13 @@ input:focus, textarea:focus { outline: none; border-color: var(--primary); }
 /* звіт */
 details { margin: 14px 0; }
 summary { cursor: pointer; padding: 10px 0; font-size: 17px; color: var(--primary); }
-#report-text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+#report-text { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 16px; }
 .danger-zone { margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--line); display: grid; gap: 12px; }
 
 /* підтвердження */
 .modal {
   position: fixed;
-  inset: 0;
+  top: 0; right: 0; bottom: 0; left: 0;
   background: rgba(0, 0, 0, 0.55);
   display: flex;
   align-items: flex-end;

@@ -36,6 +36,11 @@
 
   var UA = navigator.userAgent || '';
   var IS_IOS = /iPhone|iPad|iPod/.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  // вбудований браузер месенджера: Android WebView («; wv)»), iOS без «Safari/» (але не сторінка з іконки),
+  // або відомі позначки програм
+  var IN_APP = /; wv\)/.test(UA) || /FBAN|FBAV|Instagram|Line\/|Viber|MicroMessenger/i.test(UA) ||
+    (IS_IOS && navigator.standalone !== true && !/Safari\//.test(UA));
+  var photoReloadNote = false;
 
   // ---------------------------------------------------------------- дрібниці
   function $(id) { return document.getElementById(id); }
@@ -76,11 +81,13 @@
   // ---------------------------------------------------------------- позначка в трьох сховищах
   function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return undefined; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); return localStorage.getItem(k) === v; } catch (e) { return false; } }
-  function parseMark(s) {
+  // needPin: localStorage і IndexedDB тримають відбиток PIN; cookie — лише дату й звідки (cookie браузер
+  // сам відсилає на сервер сторінки з кожним запитом, тож у ньому не має бути нічого зайвого)
+  function parseMark(s, needPin) {
     if (typeof s !== 'string') return null;
     try {
       var m = JSON.parse(s);
-      if (m && typeof m.first === 'string' && typeof m.pin === 'string') return m;
+      if (m && typeof m.first === 'string' && (!needPin || (typeof m.pin === 'string' && typeof m.salt === 'string'))) return m;
     } catch (e) { /* пошкоджено */ }
     return null;
   }
@@ -159,11 +166,11 @@
   function readMarks() {
     var out = {};
     var ls = lsGet(LS_MARK);
-    out.ls = ls === undefined ? { state: 'err', why: 'localStorage недоступне' } : (parseMark(ls) ? { state: 'ok', m: parseMark(ls) } : { state: 'none' });
+    out.ls = ls === undefined ? { state: 'err', why: 'localStorage недоступне' } : (parseMark(ls, true) ? { state: 'ok', m: parseMark(ls, true) } : { state: 'none' });
     var ck = cookieGet();
-    out.ck = ck === undefined ? { state: 'err', why: 'cookie недоступні' } : (parseMark(ck) ? { state: 'ok', m: parseMark(ck) } : { state: 'none' });
+    out.ck = ck === undefined ? { state: 'err', why: 'cookie недоступні' } : (parseMark(ck, false) ? { state: 'ok', m: parseMark(ck, false) } : { state: 'none' });
     return idbGet().then(function (v) {
-      out.idb = parseMark(v) ? { state: 'ok', m: parseMark(v) } : { state: 'none' };
+      out.idb = parseMark(v, true) ? { state: 'ok', m: parseMark(v, true) } : { state: 'none' };
       return out;
     }, function (e) {
       out.idb = { state: 'err', why: e && e.message ? e.message : String(e) };
@@ -175,6 +182,11 @@
     if (!list.length) return null;
     list.sort(function (a, b) { return a.m.first < b.m.first ? -1 : 1; });
     return list[0].m;
+  }
+  // позначка з відбитком PIN (лише localStorage або IndexedDB)
+  function pickPinMark(marks) {
+    var list = [marks.ls, marks.idb].filter(function (x) { return x && x.state === 'ok' && x.m.pin; });
+    return list.length ? list[0].m : null;
   }
   function markLine(name, s) {
     if (!s) return name + ' — ?';
@@ -211,7 +223,7 @@
     return hashPin(salt, pin).then(function (h) {
       var m = { v: 1, first: new Date().toISOString(), how: openedFrom(), salt: salt, pin: h };
       var s = JSON.stringify(m);
-      var r = { ls: lsSet(LS_MARK, s), ck: cookieSet(s), idb: false };
+      var r = { ls: lsSet(LS_MARK, s), ck: cookieSet(JSON.stringify({ v: 1, first: m.first, how: m.how })), idb: false };
       return idbSet(s).then(function () { r.idb = true; }, function () { r.idb = false; }).then(function () {
         setupResult = r;
         mark = m;
@@ -270,6 +282,9 @@
     else if ((m = UA.match(/Firefox\/([\d.]+)/))) DEV.browser = 'Firefox ' + m[1];
     else if ((m = UA.match(/Chrome\/([\d.]+)/))) DEV.browser = 'Chrome ' + m[1];
     else if ((m = UA.match(/Version\/([\d.]+).*Safari/))) DEV.browser = 'Safari ' + m[1];
+    // Safari з iOS 26 «заморожує» версію системи в рядку браузера на 18.6; справжню видно з версії Safari
+    var sv = UA.match(/Version\/(\d+)(\.\d+)?/);
+    if (IS_IOS && sv && Number(sv[1]) >= 26 && /^iOS 18\.6/.test(DEV.os)) DEV.os = 'iOS ' + sv[1] + (sv[2] || '') + ' (за версією Safari)';
     if ((m = UA.match(/Android [\d.]+; ([^;)]+)/)) && m[1].trim() !== 'K') DEV.model = m[1].trim();
     var uad = navigator.userAgentData;
     if (uad && uad.getHighEntropyValues) {
@@ -301,7 +316,11 @@
     if (name === 'main') renderMain();
     if (name === 'scan') { renderReads(); renderMode(); startScanner(); }
     if (name === 'photo') renderPhotoTotal();
-    if (name === 'report') renderReport();
+    if (name === 'report') {
+      renderReport();
+      // позначки перечитати: на старті IndexedDB могла не відповісти вчасно
+      readMarks().then(function (m) { marks = m; if (current === 'report') $('report-text').value = buildReport(); });
+    }
   }
   function go(name) {
     history.pushState({ s: name }, '', '#' + name);
@@ -315,6 +334,8 @@
 
   // ---------------------------------------------------------------- код запрошення і PIN
   var entry = { mode: 'invite', len: 6, value: '' };
+  var pinMark = null;   // позначка з відбитком PIN
+  var pinOnly = false;  // телефон упізнано лише за cookie: PIN придумати знову, нічого не записуючи
   var firstPin = '';
   var busy = false;
   var ENTRY_TEXT = {
@@ -349,7 +370,8 @@
     entry.len = mode === 'invite' ? 6 : 4;
     entry.value = '';
     $('code-title').textContent = ENTRY_TEXT[mode][0];
-    $('code-hint').textContent = ENTRY_TEXT[mode][1];
+    $('code-hint').textContent = pinOnly && mode === 'pin-new' ?
+      'Телефон памʼятає вас: збереглась лише cookie-позначка, а PIN стерто. Придумайте 4 цифри — лише на цей раз.' : ENTRY_TEXT[mode][1];
     $('code-err').textContent = errText || '';
     $('code-forgot').hidden = mode !== 'pin';
     renderDots();
@@ -385,12 +407,14 @@
     if (entry.mode === 'pin-repeat') {
       if (v !== firstPin) { firstPin = ''; setEntry('pin-new', 'PIN не збігся. Придумайте його ще раз.'); return Promise.resolve(); }
       firstPin = '';
+      // збереглась лише cookie: позначок не відновлюємо, щоб проба бачила, що саме пережило перерву
+      if (pinOnly) { unlock(); return Promise.resolve(); }
       $('code-hint').textContent = 'Запамʼятовую телефон…';
       return createMarks(v).then(function () { return readMarks(); }).then(function (m) { marks = m; unlock(); });
     }
     // pin
-    return hashPin(mark.salt, v).then(function (h) {
-      if (h === mark.pin) { unlock(); return; }
+    return hashPin(pinMark.salt, v).then(function (h) {
+      if (h === pinMark.pin) { unlock(); return; }
       entry.value = '';
       renderDots();
       $('code-err').textContent = 'Неправильний PIN. Спробуйте ще раз.';
@@ -406,10 +430,20 @@
   // ---------------------------------------------------------------- головний екран
   function renderMain() {
     var how = openedFrom();
-    var m = mark || pickMark(marks || {});
-    $('main-status').textContent = 'Телефон запамʼятано з ' + (m ? fmtDate(m.first) : '—') + '. Відкрито: ' + OPENED_TEXT[how] + '.';
+    var m = pickMark(marks || {});
+    $('main-status').textContent = (m ? 'Телефон запамʼятано з ' + fmtDate(m.first) :
+      'Телефон НЕ запамʼятано: жодне сховище не прийняло позначку') + '. Відкрито: ' + OPENED_TEXT[how] + '.';
     var box = $('main-marks');
     box.textContent = '';
+    var notes = [];
+    if (IN_APP) notes.push('Здається, сторінку відкрито всередині іншої програми (месенджера). Відкрийте її в ' + (IS_IOS ? 'Safari' : 'Chrome') + ': меню програми → «Відкрити в браузері».');
+    if (photoReloadNote) notes.push('Під час останнього фото телефон перезавантажив сторінку — знімок не дійшов. Це записано у звіт.');
+    notes.forEach(function (t) {
+      var n = document.createElement('p');
+      n.className = 'err';
+      n.textContent = t;
+      box.appendChild(n);
+    });
     var p = document.createElement('p');
     p.textContent = 'Позначки на цьому телефоні:';
     p.style.margin = '2px 0';
@@ -436,7 +470,7 @@
       var AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return;
       if (!audioCtx) audioCtx = new AC();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
+      if (audioCtx.state !== 'running') audioCtx.resume();
       var b = audioCtx.createBuffer(1, 1, 22050);
       var s = audioCtx.createBufferSource();
       s.buffer = b;
@@ -447,7 +481,7 @@
   function beep() {
     try {
       if (!audioCtx) return;
-      if (audioCtx.state === 'suspended') audioCtx.resume();
+      if (audioCtx.state !== 'running') audioCtx.resume();
       var t = audioCtx.currentTime;
       var o = audioCtx.createOscillator();
       var g = audioCtx.createGain();
@@ -465,29 +499,37 @@
   function vibrate() { try { if (navigator.vibrate) navigator.vibrate(60); } catch (e) { /* */ } }
 
   // ---------------------------------------------------------------- читачі кодів
-  var libPromise = null;
-  function ensureLib() {
-    if (!libPromise) {
-      libPromise = new Promise(function (res, rej) {
-        if (!window.ZXingWASM) { rej(new Error('файл бібліотеки не завантажився')); return; }
-        var t0 = performance.now();
-        var p = window.ZXingWASM.prepareZXingModule({
-          overrides: {
-            locateFile: function (path, prefix) {
-              if (/\.wasm$/.test(path)) return new URL('vendor/zxing-wasm/' + path, document.baseURI).href;
-              return prefix + path;
-            }
-          },
-          fireImmediately: true
-        });
-        withTimeout(Promise.resolve(p), 30000, 'бібліотека').then(function () {
-          session.libLoadMs = Math.round(performance.now() - t0);
-          res();
-        }, rej);
-      });
-      libPromise.catch(function () { libPromise = null; });
+  // Один і той самий обʼєкт налаштувань: бібліотека за ним упізнає вже створений модуль і не вантажить wasm удруге.
+  // Без locateFile вона взяла б wasm зі стороннього CDN — тут він береться лише з цієї ж сторінки.
+  var LIB_OVERRIDES = {
+    locateFile: function (path, prefix) {
+      if (/\.wasm$/.test(path)) return new URL('vendor/zxing-wasm/' + path, document.baseURI).href;
+      return prefix + path;
     }
-    return libPromise;
+  };
+  var lib = { state: 'idle', promise: null, why: '' }; // idle | loading | ready | failed
+  function errText(e) { return e && e.message ? e.message : String(e); }
+  function ensureLib() {
+    if (lib.state === 'ready') return Promise.resolve();
+    if (lib.promise) return lib.promise;
+    lib.state = 'loading';
+    var t0 = performance.now();
+    // Повільне завантаження не обриваємо: на слабкому звʼязку воно таки дійде.
+    lib.promise = new Promise(function (res, rej) {
+      if (!window.ZXingWASM) { rej(new Error('файл бібліотеки не завантажився')); return; }
+      Promise.resolve(window.ZXingWASM.prepareZXingModule({ overrides: LIB_OVERRIDES, fireImmediately: true })).then(res, rej);
+    }).then(function () {
+      lib.state = 'ready';
+      lib.promise = null;
+      session.libLoadMs = Math.round(performance.now() - t0);
+    }, function (e) {
+      lib.state = 'failed';
+      lib.why = errText(e);
+      lib.promise = null;
+      try { if (window.ZXingWASM) window.ZXingWASM.purgeZXingModule(); } catch (x) { /* */ }
+      throw e;
+    });
+    return lib.promise;
   }
 
   var native = { state: 'unknown', detector: null, formats: [] };
@@ -518,14 +560,19 @@
   function camErrorText(e) {
     var n = e && e.name;
     if (n === 'NotAllowedError' || n === 'SecurityError' || n === 'PermissionDeniedError') {
+      var tail2 = '\n\nПотім поверніться сюди й натисніть «Спробувати ще раз». Номер можна ввести руками нижче.';
+      var fromIcon = openedFrom() === 'icon';
       if (IS_IOS) {
-        return 'Камеру не дозволено.\n\nЩо натиснути: «Параметри» телефона → «Safari» → «Камера» → «Дозволити» (або «Запитувати»).\n' +
-          'Або в Safari: кнопка «аА» ліворуч від адреси → «Параметри вебсайту» → «Камера» → «Дозволити».\n\n' +
-          'Потім поверніться сюди й натисніть «Спробувати ще раз». Номер можна ввести руками нижче.';
+        return 'Камеру не дозволено.\n\n' + (fromIcon ?
+          'Що зробити: закрийте сторінку (змахніть її вгору в перемикачі програм) і відкрийте знову з іконки — iPhone спитає ще раз, натисніть «Дозволити».\n' +
+          'Якщо не питає: «Параметри» → «Програми» → «Safari» → «Камера» → «Запитувати» (на старіших iPhone: «Параметри» → «Safari» → «Камера»).' :
+          'Що натиснути: «Параметри» → «Програми» → «Safari» → «Камера» → «Дозволити» (на старіших iPhone: «Параметри» → «Safari» → «Камера»).\n' +
+          'Або в Safari: кнопка ліворуч від адреси («аА» або значок сторінки) → «Параметри вебсайту» → «Камера» → «Дозволити».') + tail2;
       }
-      return 'Камеру не дозволено.\n\nЩо натиснути: значок ліворуч від адреси (замок або повзунки) → «Дозволи» → «Камера» → «Дозволити».\n' +
-        'Якщо сторінка відкрита з іконки: утримуйте іконку → «Про застосунок» (ⓘ) → «Дозволи» → «Камера» → «Дозволити».\n\n' +
-        'Потім поверніться сюди й натисніть «Спробувати ще раз». Номер можна ввести руками нижче.';
+      return 'Камеру не дозволено.\n\n' + (fromIcon ?
+        'Що натиснути: утримуйте іконку «Проба» → «Про застосунок» (ⓘ) → «Дозволи» → «Камера» → «Дозволити».\n' :
+        'Що натиснути: значок ліворуч від адреси (замок або повзунки) → «Дозволи» → «Камера» → «Дозволити».\n') +
+        'Якщо камеру заборонено самому Chrome: «Налаштування» телефона → «Програми» → «Chrome» → «Дозволи» → «Камера» → «Дозволити».' + tail2;
     }
     if (n === 'NotFoundError' || n === 'OverconstrainedError' || n === 'DevicesNotFoundError') return 'Камеру не знайдено. Номер можна ввести руками нижче.';
     if (n === 'NotReadableError' || n === 'TrackStartError' || n === 'AbortError') return 'Камера зайнята іншою програмою або не запускається. Закрийте інші програми з камерою й натисніть «Спробувати ще раз».';
@@ -550,6 +597,14 @@
       if (gen !== sc.gen || current !== 'scan') { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
       sc.stream = stream;
       sc.track = stream.getVideoTracks()[0];
+      if (sc.track) {
+        sc.track.addEventListener('ended', function () {
+          if (gen !== sc.gen) return;
+          stopScanner();
+          showCamMsg('Камера вимкнулась — мабуть, її забрала інша програма або дзвінок. Натисніть «Спробувати ще раз».', true);
+          setScanState('');
+        });
+      }
       video.srcObject = stream;
       var pl = video.play();
       if (pl && pl.catch) pl.catch(function () { /* autoplay без звуку дозволений */ });
@@ -557,22 +612,8 @@
         if (gen !== sc.gen) return;
         session.cam = video.videoWidth + '×' + video.videoHeight;
         setupTorch(gen);
-        requestWake();
-        var ready = mode === 'lib' ? ensureLib() : Promise.resolve();
-        if (mode === 'lib') setScanState('Готую читач кодів…');
-        return ready.then(function () {
-          if (gen !== sc.gen) return;
-          sc.running = true;
-          sc.startAt = sc.lastAt = performance.now();
-          sc.seen = {};
-          session.runs++;
-          saveSession();
-          setScanState('Наведіть камеру на штрихкод. Тримайте телефон за 15–20 см від етикетки.');
-          loop(gen);
-        }, function (e) {
-          if (gen !== sc.gen) return;
-          setScanState('Не вдалося завантажити читач кодів: ' + (e && e.message ? e.message : e) + (native.state === 'ok' ? '. Перемкніть на «Вбудоване».' : ''));
-        });
+        requestWake(gen);
+        prepareAndBegin(gen);
       });
     }).catch(function (e) {
       if (gen !== sc.gen) return;
@@ -582,6 +623,42 @@
       showCamMsg(camErrorText(e), true);
       setScanState('');
     });
+  }
+
+  var READY_TEXT = 'Наведіть камеру на штрихкод. Тримайте телефон за 15–20 см від етикетки.';
+  // камера вже працює; запускає розбір кадрів, щойно готовий обраний спосіб читання
+  function prepareAndBegin(gen) {
+    if (gen !== sc.gen || sc.running) return;
+    if (mode === 'native' && native.detector) { beginScan(gen); return; }
+    setScanState('Готую читач кодів…');
+    var slow = setTimeout(function () {
+      if (gen === sc.gen && !sc.running) setScanState('Читач кодів ще завантажується — мабуть, слабкий звʼязок. Зачекайте.');
+    }, 12000);
+    ensureLib().then(function () {
+      clearTimeout(slow);
+      if (gen === sc.gen && mode === 'lib') beginScan(gen);
+    }, function (e) {
+      clearTimeout(slow);
+      if (gen !== sc.gen || sc.running) return;
+      session.libError = errText(e);
+      saveSession();
+      showCamMsg('Не вдалося завантажити читач кодів — мабуть, обірвався звʼязок.' +
+        (native.state === 'ok' ? '\nМожна перемкнути нижче на «Вбудоване».' : '') +
+        '\nНатисніть «Спробувати ще раз». Номер можна ввести руками нижче.', true);
+      setScanState('');
+    });
+  }
+  function beginScan(gen) {
+    if (gen !== sc.gen || sc.running) return;
+    hideCamMsg();
+    sc.running = true;
+    sc.startAt = sc.lastAt = performance.now();
+    sc.seen = {};
+    sc.errRun = 0;
+    session.runs++;
+    saveSession();
+    setScanState(READY_TEXT);
+    loop(gen);
   }
 
   function waitVideo(gen) {
@@ -622,48 +699,57 @@
     });
   }
 
-  function grabFrame() {
+  // Кадр обрізаємо до тієї частини, яку людина бачить на екрані (відео заповнює вікно з обрізанням країв),
+  // і обидва способи читання отримують однаковий шматок — порівняння чесне.
+  function drawVisible() {
     var vw = video.videoWidth, vh = video.videoHeight;
-    var k = Math.min(1, 1920 / Math.max(vw, vh));
-    var w = Math.round(vw * k), h = Math.round(vh * k);
+    var ew = video.clientWidth || vw, eh = video.clientHeight || vh;
+    var s = Math.max(ew / vw, eh / vh);
+    var sw = Math.min(vw, ew / s), sh = Math.min(vh, eh / s);
+    var sx = (vw - sw) / 2, sy = (vh - sh) / 2;
+    var k = Math.min(1, 1920 / Math.max(sw, sh));
+    var w = Math.max(1, Math.round(sw * k)), h = Math.max(1, Math.round(sh * k));
     if (canvas.width !== w) canvas.width = w;
     if (canvas.height !== h) canvas.height = h;
-    ctx.drawImage(video, 0, 0, w, h);
-    return ctx.getImageData(0, 0, w, h);
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+    session.crop = w + '×' + h;
+    return { w: w, h: h };
   }
   function decodeLib() {
-    return ensureLib().then(function () {
-      return window.ZXingWASM.readBarcodes(grabFrame(), LIB_OPTIONS);
-    }).then(function (out) {
-      return out.filter(function (r) { return r.isValid && r.text; }).map(function (r) {
-        return { text: r.text, type: typeLabel(r.format, r.symbology) };
+    var r = drawVisible();
+    return window.ZXingWASM.readBarcodes(ctx.getImageData(0, 0, r.w, r.h), LIB_OPTIONS).then(function (out) {
+      return out.filter(function (x) { return x.isValid && x.text; }).map(function (x) {
+        return { text: x.text, type: typeLabel(x.format, x.symbology) };
       });
     });
   }
   function decodeNative() {
-    return native.detector.detect(video).then(function (out) {
+    drawVisible();
+    return withTimeout(native.detector.detect(canvas), 3000, 'вбудоване читання').then(function (out) {
       return out.filter(function (b) { return b.rawValue; }).map(function (b) { return { text: b.rawValue, type: typeLabel(b.format) }; });
     });
   }
 
   function loop(gen) {
     if (!sc.running || gen !== sc.gen) return;
-    var ready = video.readyState >= 2 && video.videoWidth > 0;
-    var m = mode;
+    var m = mode === 'native' && native.detector ? 'native' : 'lib';
+    // кадр готовий і обраний спосіб готовий (бібліотека могла ще вантажитись після перемикання)
+    var ready = video.readyState >= 2 && video.videoWidth > 0 && (m === 'native' || lib.state === 'ready');
     var t0 = performance.now();
-    var p = !ready ? Promise.resolve([]) : (m === 'native' && native.detector ? decodeNative() : decodeLib());
+    var p = !ready ? Promise.resolve([]) : (m === 'native' ? decodeNative() : decodeLib());
     p.then(function (found) {
       if (!sc.running || gen !== sc.gen) return;
       if (ready) {
-        var st = session.frames[m === 'native' && native.detector ? 'native' : 'lib'];
+        var st = session.frames[m];
         st.n++;
         st.ms += performance.now() - t0;
+        if (sc.errRun >= 5) setScanState(READY_TEXT); // знову працює — прибрати повідомлення про помилку
+        sc.errRun = 0;
       }
-      sc.errRun = 0;
-      for (var i = 0; i < found.length; i++) handleCode(found[i].text, found[i].type, m === 'native' && native.detector ? 'native' : 'lib');
+      for (var i = 0; i < found.length; i++) handleCode(found[i].text, found[i].type, m);
     }, function (e) {
       sc.errors++;
-      sc.lastErr = e && e.message ? e.message : String(e);
+      sc.lastErr = errText(e);
       session.decodeErrors = (session.decodeErrors || 0) + 1;
       session.lastDecodeError = sc.lastErr;
       sc.errRun = (sc.errRun || 0) + 1;
@@ -785,9 +871,19 @@
     saveSession();
     renderMode();
     sc.seen = {};
-    if (sc.running) sc.lastAt = performance.now();
-    if (m === 'lib') {
-      ensureLib().catch(function (e) { setScanState('Не вдалося завантажити читач кодів: ' + (e && e.message ? e.message : e)); });
+    if (current !== 'scan' || !sc.stream) return;
+    if (!sc.running) {
+      // камера є, але розбір ще не йшов (бібліотека вантажилась або не завантажилась) — почати новим способом
+      hideCamMsg();
+      prepareAndBegin(sc.gen);
+      return;
+    }
+    sc.lastAt = performance.now();
+    if (m === 'lib' && lib.state !== 'ready') {
+      setScanState('Готую читач кодів…');
+      ensureLib().then(function () { setScanState('Читає бібліотека.'); },
+        function (e) { session.libError = errText(e); saveSession(); setScanState('Не вдалося завантажити читач кодів. Натисніть «Назад» і знову «Сканувати».'); });
+      return;
     }
     setScanState(m === 'native' ? 'Читає вбудований засіб телефона.' : 'Читає бібліотека.');
   }
@@ -804,6 +900,7 @@
     }
     check();
     setTimeout(check, 800);
+    setTimeout(check, 2500); // деякі Android повідомляють про ліхтарик пізніше
   }
   function toggleTorch() {
     var t = sc.track;
@@ -817,10 +914,13 @@
     }, function (e) { setScanState('Ліхтарик не вмикається: ' + (e && e.message ? e.message : e)); });
   }
 
-  function requestWake() {
+  function requestWake(gen) {
     try {
       if (navigator.wakeLock && navigator.wakeLock.request) {
-        navigator.wakeLock.request('screen').then(function (w) { sc.wake = w; }, function () { /* */ });
+        navigator.wakeLock.request('screen').then(function (w) {
+          if (gen !== sc.gen) { try { w.release(); } catch (e) { /* */ } return; } // сканер уже закрили
+          sc.wake = w;
+        }, function () { /* */ });
       }
     } catch (e) { /* */ }
   }
@@ -833,28 +933,52 @@
     if (document.hidden) {
       if (current === 'scan') stopScanner();
       saveSession();
-    } else if (current === 'scan' && unlocked) {
-      startScanner();
+    } else {
+      if (current === 'scan' && unlocked) startScanner();
+      // повернулись із камери телефона без знімка (скасували) — позначку «фото в дорозі» прибрати
+      if (photoPicking) setTimeout(function () { if (photoPicking) photoPendingClear(); }, 3000);
     }
   });
   window.addEventListener('pagehide', saveSession);
 
   // ---------------------------------------------------------------- фото
+  // Позначка в sessionStorage переживає перезавантаження сторінки, поки відкрита камера телефона:
+  // так видно, що знімок загубився не з вини людини.
+  var PHOTO_PENDING = KEY + '.photo-pending';
+  var photoPicking = false;
+  function photoPendingSet() {
+    photoPicking = true;
+    try { sessionStorage.setItem(PHOTO_PENDING, String(Date.now())); } catch (e) { /* */ }
+  }
+  function photoPendingClear() {
+    photoPicking = false;
+    try { sessionStorage.removeItem(PHOTO_PENDING); } catch (e) { /* */ }
+  }
+  function checkPhotoReload() {
+    var t = null;
+    try { t = sessionStorage.getItem(PHOTO_PENDING); sessionStorage.removeItem(PHOTO_PENDING); } catch (e) { /* */ }
+    if (t && Date.now() - Number(t) < 15 * 60 * 1000) {
+      session.photoReloads = (session.photoReloads || 0) + 1;
+      photoReloadNote = true;
+      saveSession();
+    }
+  }
   var previewUrl = null;
-  function clearPhoto() {
+  function clearPhoto(keepInput) {
     if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
     var img = $('photo-preview');
     img.removeAttribute('src');
     $('photo-result').hidden = true;
     $('photo-stats').textContent = '';
     $('photo-state').textContent = '';
-    try { $('photo-input').value = ''; } catch (e) { /* */ }
+    if (!keepInput) { try { $('photo-input').value = ''; } catch (e) { /* */ } }
   }
   function onPhoto() {
     var input = $('photo-input');
+    photoPendingClear();
     var f = input.files && input.files[0];
     if (!f) return;
-    clearPhoto();
+    clearPhoto(true);
     $('photo-state').textContent = 'Стискаю…';
     var t0 = performance.now();
     var srcUrl = URL.createObjectURL(f);
@@ -920,14 +1044,15 @@
   }
   function buildReport() {
     var L = [];
-    var m = mark || pickMark(marks || {});
+    var m = pickMark(marks || {});
     var model = ($('model-input').value || '').trim();
     L.push('Проба сканера — звіт');
     L.push('Версія сторінки: ' + APP_VERSION + ' · складено ' + fmtDate(new Date().toISOString()));
     L.push('Телефон: ' + (model || DEV.model || 'модель не вказано') + (model && DEV.model && model !== DEV.model ? ' (браузер каже: ' + DEV.model + ')' : '') +
       ' · ' + (DEV.os || '?') + ' · ' + (DEV.browser || '?'));
     L.push('Екран: ' + screen.width + '×' + screen.height + ', щільність ×' + (window.devicePixelRatio || 1));
-    L.push('Відкрито зараз: ' + OPENED_TEXT[openedFrom()]);
+    L.push('Відкрито зараз: ' + OPENED_TEXT[openedFrom()] + (IN_APP ? ' (схоже, всередині іншої програми)' : ''));
+    if (pinOnly) L.push('PIN цього разу придумано знову: збереглась лише cookie-позначка');
     L.push('Перший запуск: ' + (m ? fmtDate(m.first) + (m.how ? ' (' + OPENED_TEXT[m.how] + ')' : '') : '—'));
     L.push('Позначки:');
     L.push('  ' + markLine('localStorage', marks && marks.ls));
@@ -935,9 +1060,12 @@
     L.push('  ' + markLine('IndexedDB', marks && marks.idb));
     L.push('Постійне сховище: ' + (persisted === null ? 'невідомо' : persisted ? 'так' : 'ні'));
     L.push('Вбудоване читання кодів: ' + nativeText());
-    L.push('Бібліотека: ' + LIB_NAME + ' ' + LIB_VERSION + (session.libLoadMs !== null ? ', завантаження ' + session.libLoadMs + ' мс' : ''));
+    L.push('Бібліотека: ' + LIB_NAME + ' ' + LIB_VERSION + (session.libLoadMs !== null ? ', завантаження ' + session.libLoadMs + ' мс' : '') +
+      (session.libError ? ' · помилка завантаження: ' + session.libError : ''));
     L.push('Спосіб читання зараз: ' + METHOD_LABEL[mode]);
-    L.push('Камера: ' + (session.cam || 'не запускалась') + ' · ліхтарик: ' + (session.torch || '—'));
+    L.push('Камера: ' + (session.cam || 'не запускалась') + (session.crop ? ' (читається видима частина ' + session.crop + ')' : '') +
+      ' · ліхтарик: ' + (session.torch || '—'));
+    L.push('Звук: ' + (audioCtx ? audioCtx.state : 'немає') + ' · вібрація: ' + (navigator.vibrate ? 'є' : 'немає'));
     if (session.camErrors.length) L.push('Помилки камери: ' + session.camErrors.join('; '));
     L.push('Запусків сканера: ' + session.runs);
     if (session.decodeErrors) L.push('Помилок читача: ' + session.decodeErrors + ' (остання: ' + session.lastDecodeError + ')');
@@ -953,7 +1081,7 @@
         L.push((i + 1) + '. ' + visible(r.v) + ' · ' + rowMeta(r));
       });
     }
-    L.push('Фото: ' + session.photos.length);
+    L.push('Фото: ' + session.photos.length + (session.photoReloads ? ' · сторінку перезавантажено під час фото: ' + session.photoReloads : ''));
     session.photos.forEach(function (p, i) {
       L.push((i + 1) + '. ' + fmtBytes(p.before) + ' → ' + fmtBytes(p.after) + ' · ' + p.w0 + '×' + p.h0 + ' → ' + p.w1 + '×' + p.h1 + ' · ' + p.ms + ' мс · ' + p.type);
     });
@@ -1029,12 +1157,13 @@
     clearPhoto();
     wiping = true;
     session = defaultSession();
+    // Адреса kladvinn.github.io спільна з іншими сторінками акаунта — стираємо лише свої ключі
     try {
       var ks = [];
-      for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (k && k.indexOf(KEY) === 0) ks.push(k); }
+      for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (k && k.indexOf(KEY + '.') === 0) ks.push(k); }
       ks.forEach(function (k) { localStorage.removeItem(k); });
     } catch (e) { /* */ }
-    try { sessionStorage.clear(); } catch (e) { /* */ }
+    try { sessionStorage.removeItem(PHOTO_PENDING); } catch (e) { /* */ }
     cookieDel();
     var jobs = [idbDelete()];
     if (window.caches && caches.keys) {
@@ -1048,7 +1177,8 @@
         return Promise.all(rs.filter(function (r) { return r.scope.indexOf(scope) === 0; }).map(function (r) { return r.unregister(); }));
       }).catch(function () { /* */ }));
     }
-    return Promise.all(jobs).then(function () {
+    // якщо щось зависло — однаково перезавантажити за 5 с
+    return withTimeout(Promise.all(jobs), 5000, 'стирання').catch(function () { /* */ }).then(function () {
       location.replace(location.pathname + location.search);
     });
   }
@@ -1083,8 +1213,14 @@
       if (!v) return;
       if (handleCode(v, '—', 'manual')) inp.value = '';
     });
+    $('photo-input').addEventListener('click', photoPendingSet);
+    $('photo-input').addEventListener('cancel', photoPendingClear);
     $('photo-input').addEventListener('change', onPhoto);
-    $('btn-photo-clear').addEventListener('click', clearPhoto);
+    $('btn-photo-clear').addEventListener('click', function () { clearPhoto(); });
+    // «Почати заново» в іншому вікні цієї ж сторінки (вкладка й іконка на Android) — не записати старе назад
+    window.addEventListener('storage', function (e) {
+      if (e.key === LS_MARK && e.newValue === null) { wiping = true; location.reload(); }
+    });
     $('btn-copy').addEventListener('click', copyReport);
     $('model-input').addEventListener('input', function () { session.model = this.value.trim(); saveSession(); });
     $('note-input').addEventListener('input', function () { session.note = this.value; saveSession(); });
@@ -1114,13 +1250,17 @@
     buildKeypad();
     bind();
     session = loadSession();
+    checkPhotoReload();
     mode = session.mode === 'native' ? 'native' : 'lib';
     Promise.all([detectDevice(), initNative(), checkPersisted(), readMarks()]).then(function (r) {
       marks = r[3];
       if (mode === 'native' && native.state !== 'ok') mode = 'lib';
       mark = pickMark(marks);
-      if (!mark) { firstPin = ''; setEntry('invite'); }
-      else setEntry('pin');
+      pinMark = pickPinMark(marks);
+      firstPin = '';
+      if (!mark) setEntry('invite');
+      else if (pinMark) setEntry('pin');
+      else { pinOnly = true; setEntry('pin-new'); }
       registerSW();
     }).catch(function (e) {
       $('boot-msg').textContent = 'Помилка запуску: ' + (e && e.message ? e.message : e);
