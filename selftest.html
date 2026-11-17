@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Самоперевірка читача</title>
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/zxing-wasm/zxing-reader.iife.js" defer></script>
+<script src="selftest.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>Самоперевірка читача</h1>
+  <p class="hint">Сторінка читає вбудовані тестові коди без камери: бібліотекою і, де є, вбудованим засобом браузера. Нічого не надсилає.</p>
+  <p class="status" id="st-summary">Перевіряю…</p>
+  <ol class="reads" id="st-list"></ol>
+  <p class="muted small" id="st-env"></p>
+</main>
+</body>
+</html>

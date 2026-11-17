@@ -1,0 +1,1144 @@
+'use strict';
+(function () {
+  // ---------------------------------------------------------------- сталі
+  var APP_VERSION = '1';
+  var LIB_NAME = 'zxing-wasm';
+  var LIB_VERSION = '3.1.6';
+  var KEY = 'scan-proba';
+  var LS_MARK = KEY + '.mark';
+  var LS_SESSION = KEY + '.session';
+  var COOKIE = 'scan_proba_mark';
+  var IDB_NAME = 'scan-proba';
+  var IDB_STORE = 'kv';
+  var BASE_PATH = location.pathname.replace(/[^/]*$/, '') || '/';
+  var IS_HTTPS = location.protocol === 'https:';
+
+  // Формати, які шукаємо: потрібні для проби + кілька поширених поруч.
+  var LIB_FORMATS = ['Code128', 'ITF', 'Code39', 'EAN13', 'EAN8', 'UPCA', 'UPCE', 'Code93', 'QRCode', 'DataMatrix', 'PDF417', 'Aztec'];
+  var NATIVE_FORMATS = ['code_128', 'itf', 'code_39', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_93', 'qr_code', 'data_matrix', 'pdf417', 'aztec'];
+  var LIB_OPTIONS = {
+    formats: LIB_FORMATS,
+    tryHarder: true,
+    tryRotate: true,
+    tryInvert: false,
+    tryDownscale: true,
+    maxNumberOfSymbols: 4
+  };
+  var TYPE_LABEL = {
+    Code128: 'Code 128', ITF: 'ITF', ITF14: 'ITF-14', Code39: 'Code 39', Code39Std: 'Code 39', Code39Ext: 'Code 39',
+    EAN13: 'EAN-13', EAN8: 'EAN-8', UPCA: 'UPC-A', UPCE: 'UPC-E', EANUPC: 'EAN/UPC', Code93: 'Code 93',
+    QRCode: 'QR', QRCodeModel1: 'QR', QRCodeModel2: 'QR', DataMatrix: 'Data Matrix',
+    PDF417: 'PDF417', CompactPDF417: 'PDF417', Aztec: 'Aztec', AztecCode: 'Aztec',
+    code_128: 'Code 128', itf: 'ITF', code_39: 'Code 39', ean_13: 'EAN-13', ean_8: 'EAN-8', upc_a: 'UPC-A',
+    upc_e: 'UPC-E', code_93: 'Code 93', qr_code: 'QR', data_matrix: 'Data Matrix', pdf417: 'PDF417', aztec: 'Aztec'
+  };
+  var METHOD_LABEL = { lib: 'бібліотека', native: 'вбудоване', manual: 'вручну' };
+
+  var UA = navigator.userAgent || '';
+  var IS_IOS = /iPhone|iPad|iPod/.test(UA) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  // ---------------------------------------------------------------- дрібниці
+  function $(id) { return document.getElementById(id); }
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function fmtDate(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '—';
+    return pad(d.getDate()) + '.' + pad(d.getMonth() + 1) + '.' + d.getFullYear() + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+  function fmtClock(ms) {
+    var d = new Date(ms);
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+  function fmtBytes(b) {
+    if (b < 1024) return b + ' Б';
+    if (b < 1024 * 1024) return Math.round(b / 1024) + ' КБ';
+    return (b / 1048576).toFixed(1).replace('.', ',') + ' МБ';
+  }
+  function visible(s) {
+    // керівні символи (напр. роздільник GS у кодах GS1) показуємо явно
+    return String(s).replace(/[\u0000-\u001f\u007f]/g, function (c) {
+      return c === '\u001d' ? '⟨GS⟩' : '⟨' + c.charCodeAt(0).toString(16).padStart(2, '0') + '⟩';
+    });
+  }
+  function typeLabel(f, family) { return TYPE_LABEL[f] || TYPE_LABEL[family] || String(f || '?'); }
+  function withTimeout(p, ms, what) {
+    return Promise.race([p, new Promise(function (_, rej) {
+      setTimeout(function () { rej(new Error((what || 'дія') + ': немає відповіді ' + ms + ' мс')); }, ms);
+    })]);
+  }
+  function openedFrom() {
+    var mm = window.matchMedia ? function (q) { return window.matchMedia(q).matches; } : function () { return false; };
+    var standalone = mm('(display-mode: standalone)') || mm('(display-mode: fullscreen)') || mm('(display-mode: minimal-ui)') || navigator.standalone === true;
+    return standalone ? 'icon' : 'browser';
+  }
+  var OPENED_TEXT = { icon: 'з іконки', browser: 'з браузера' };
+
+  // ---------------------------------------------------------------- позначка в трьох сховищах
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return undefined; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); return localStorage.getItem(k) === v; } catch (e) { return false; } }
+  function parseMark(s) {
+    if (typeof s !== 'string') return null;
+    try {
+      var m = JSON.parse(s);
+      if (m && typeof m.first === 'string' && typeof m.pin === 'string') return m;
+    } catch (e) { /* пошкоджено */ }
+    return null;
+  }
+
+  function cookieGet() {
+    try {
+      var parts = document.cookie ? document.cookie.split('; ') : [];
+      for (var i = 0; i < parts.length; i++) {
+        var j = parts[i].indexOf('=');
+        if (parts[i].slice(0, j) === COOKIE) return decodeURIComponent(parts[i].slice(j + 1));
+      }
+      return null;
+    } catch (e) { return undefined; }
+  }
+  function cookieSet(v) {
+    try {
+      document.cookie = COOKIE + '=' + encodeURIComponent(v) + '; Max-Age=34560000; Path=' + BASE_PATH + '; SameSite=Lax' + (IS_HTTPS ? '; Secure' : '');
+      return cookieGet() === v;
+    } catch (e) { return false; }
+  }
+  function cookieDel() {
+    [BASE_PATH, '/'].forEach(function (p) {
+      try { document.cookie = COOKIE + '=; Max-Age=0; Path=' + p + '; SameSite=Lax' + (IS_HTTPS ? '; Secure' : ''); } catch (e) { /* немає */ }
+    });
+  }
+
+  var idbConn = null;
+  function idbOpen() {
+    return new Promise(function (res, rej) {
+      if (!('indexedDB' in window) || !window.indexedDB) { rej(new Error('немає IndexedDB')); return; }
+      var r = indexedDB.open(IDB_NAME, 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore(IDB_STORE); };
+      r.onsuccess = function () {
+        idbConn = r.result;
+        idbConn.onversionchange = function () { try { idbConn.close(); } catch (e) { /* */ } idbConn = null; };
+        res(idbConn);
+      };
+      r.onerror = function () { rej(r.error || new Error('помилка IndexedDB')); };
+      r.onblocked = function () { rej(new Error('IndexedDB зайнята')); };
+    });
+  }
+  function idbDb() { return idbConn ? Promise.resolve(idbConn) : withTimeout(idbOpen(), 4000, 'IndexedDB'); }
+  function idbGet() {
+    return idbDb().then(function (db) {
+      return withTimeout(new Promise(function (res, rej) {
+        var rq = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get('mark');
+        rq.onsuccess = function () { res(rq.result === undefined ? null : rq.result); };
+        rq.onerror = function () { rej(rq.error); };
+      }), 4000, 'IndexedDB');
+    });
+  }
+  function idbSet(v) {
+    return idbDb().then(function (db) {
+      return withTimeout(new Promise(function (res, rej) {
+        var tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(v, 'mark');
+        tx.oncomplete = function () { res(true); };
+        tx.onerror = function () { rej(tx.error); };
+        tx.onabort = function () { rej(tx.error || new Error('скасовано')); };
+      }), 4000, 'IndexedDB');
+    });
+  }
+  function idbDelete() {
+    return new Promise(function (res) {
+      if (idbConn) { try { idbConn.close(); } catch (e) { /* */ } idbConn = null; }
+      if (!window.indexedDB) { res('немає'); return; }
+      var r = indexedDB.deleteDatabase(IDB_NAME);
+      r.onsuccess = function () { res('стерто'); };
+      r.onerror = function () { res('помилка'); };
+      r.onblocked = function () { res('зайнято'); };
+      setTimeout(function () { res('немає відповіді'); }, 4000);
+    });
+  }
+
+  // стан кожної позначки: {state: 'ok'|'none'|'err', m, why}
+  function readMarks() {
+    var out = {};
+    var ls = lsGet(LS_MARK);
+    out.ls = ls === undefined ? { state: 'err', why: 'localStorage недоступне' } : (parseMark(ls) ? { state: 'ok', m: parseMark(ls) } : { state: 'none' });
+    var ck = cookieGet();
+    out.ck = ck === undefined ? { state: 'err', why: 'cookie недоступні' } : (parseMark(ck) ? { state: 'ok', m: parseMark(ck) } : { state: 'none' });
+    return idbGet().then(function (v) {
+      out.idb = parseMark(v) ? { state: 'ok', m: parseMark(v) } : { state: 'none' };
+      return out;
+    }, function (e) {
+      out.idb = { state: 'err', why: e && e.message ? e.message : String(e) };
+      return out;
+    });
+  }
+  function pickMark(marks) {
+    var list = [marks.ls, marks.idb, marks.ck].filter(function (x) { return x && x.state === 'ok'; });
+    if (!list.length) return null;
+    list.sort(function (a, b) { return a.m.first < b.m.first ? -1 : 1; });
+    return list[0].m;
+  }
+  function markLine(name, s) {
+    if (!s) return name + ' — ?';
+    if (s.state === 'ok') return name + ' — є, з ' + fmtDate(s.m.first);
+    if (s.state === 'none') return name + ' — немає';
+    return name + ' — не читається (' + s.why + ')';
+  }
+
+  function randomHex(n) {
+    var a = new Uint8Array(n);
+    (window.crypto || window.msCrypto).getRandomValues(a);
+    return Array.prototype.map.call(a, function (x) { return x.toString(16).padStart(2, '0'); }).join('');
+  }
+  function hashPin(salt, pin) {
+    var s = salt + ':' + pin;
+    if (window.crypto && crypto.subtle && window.TextEncoder) {
+      return crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)).then(function (buf) {
+        return 'sha256:' + Array.prototype.map.call(new Uint8Array(buf), function (x) { return x.toString(16).padStart(2, '0'); }).join('');
+      });
+    }
+    // запасний простий хеш (лише для імітації входу)
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return Promise.resolve('fnv:' + h.toString(16));
+  }
+
+  var marks = null;       // останнє прочитане
+  var mark = null;        // чинна позначка
+  var persisted = null;   // постійне сховище: true/false/null
+  var setupResult = null; // що вдалося записати при першому запуску (лише в цьому відкритті)
+
+  function createMarks(pin) {
+    var salt = randomHex(16);
+    return hashPin(salt, pin).then(function (h) {
+      var m = { v: 1, first: new Date().toISOString(), how: openedFrom(), salt: salt, pin: h };
+      var s = JSON.stringify(m);
+      var r = { ls: lsSet(LS_MARK, s), ck: cookieSet(s), idb: false };
+      return idbSet(s).then(function () { r.idb = true; }, function () { r.idb = false; }).then(function () {
+        setupResult = r;
+        mark = m;
+        return requestPersist();
+      });
+    });
+  }
+  function requestPersist() {
+    if (!navigator.storage || !navigator.storage.persist) { persisted = null; return Promise.resolve(); }
+    return withTimeout(navigator.storage.persist(), 3000, 'persist').then(function (v) { persisted = !!v; }, function () { /* */ });
+  }
+  function checkPersisted() {
+    if (!navigator.storage || !navigator.storage.persisted) return Promise.resolve();
+    return withTimeout(navigator.storage.persisted(), 3000, 'persisted').then(function (v) { persisted = !!v; }, function () { /* */ });
+  }
+
+  // ---------------------------------------------------------------- сеанс проби (лише на телефоні)
+  function defaultSession() {
+    return {
+      reads: [], photos: [], note: '', model: '', mode: 'lib',
+      frames: { lib: { n: 0, ms: 0 }, native: { n: 0, ms: 0 } },
+      runs: 0, cam: '', torch: '', libLoadMs: null, camErrors: []
+    };
+  }
+  function loadSession() {
+    try {
+      var s = JSON.parse(localStorage.getItem(LS_SESSION));
+      if (s && Array.isArray(s.reads)) {
+        var d = defaultSession();
+        for (var k in s) if (Object.prototype.hasOwnProperty.call(s, k)) d[k] = s[k];
+        if (!d.frames || !d.frames.lib || !d.frames.native) d.frames = defaultSession().frames;
+        return d;
+      }
+    } catch (e) { /* немає або пошкоджено */ }
+    return defaultSession();
+  }
+  var session = defaultSession();
+  var wiping = false; // під час «почати заново» нічого не записуємо назад
+  function saveSession() {
+    if (wiping) return;
+    try { localStorage.setItem(LS_SESSION, JSON.stringify(session)); } catch (e) { /* */ }
+  }
+
+  // ---------------------------------------------------------------- телефон і браузер
+  var DEV = { model: '', os: '', browser: '', ua: UA };
+  function detectDevice() {
+    var m;
+    if (/(iPhone|iPad|iPod)/.test(UA) && (m = UA.match(/OS (\d+[_\d]*) like Mac OS X/))) DEV.os = 'iOS ' + m[1].replace(/_/g, '.');
+    else if ((m = UA.match(/Android ([\d.]+)/))) DEV.os = 'Android ' + m[1];
+    else if (/Mac OS X/.test(UA)) DEV.os = IS_IOS ? 'iPadOS' : 'macOS';
+    else if (/Windows/.test(UA)) DEV.os = 'Windows';
+    if ((m = UA.match(/CriOS\/([\d.]+)/))) DEV.browser = 'Chrome ' + m[1];
+    else if ((m = UA.match(/FxiOS\/([\d.]+)/))) DEV.browser = 'Firefox ' + m[1];
+    else if ((m = UA.match(/EdgiOS\/([\d.]+)|EdgA\/([\d.]+)/))) DEV.browser = 'Edge ' + (m[1] || m[2]);
+    else if ((m = UA.match(/SamsungBrowser\/([\d.]+)/))) DEV.browser = 'Samsung Internet ' + m[1];
+    else if ((m = UA.match(/Firefox\/([\d.]+)/))) DEV.browser = 'Firefox ' + m[1];
+    else if ((m = UA.match(/Chrome\/([\d.]+)/))) DEV.browser = 'Chrome ' + m[1];
+    else if ((m = UA.match(/Version\/([\d.]+).*Safari/))) DEV.browser = 'Safari ' + m[1];
+    if ((m = UA.match(/Android [\d.]+; ([^;)]+)/)) && m[1].trim() !== 'K') DEV.model = m[1].trim();
+    var uad = navigator.userAgentData;
+    if (uad && uad.getHighEntropyValues) {
+      return withTimeout(uad.getHighEntropyValues(['model', 'platformVersion', 'fullVersionList']), 2000, 'uaData').then(function (h) {
+        if (h.model) DEV.model = h.model;
+        if (h.platform === 'Android' && h.platformVersion) DEV.os = 'Android ' + h.platformVersion;
+        var list = h.fullVersionList || [];
+        var b = list.filter(function (x) { return !/Not.?A.?Brand|Chromium/i.test(x.brand); })[0];
+        if (b && !/SamsungBrowser|EdgA/.test(UA)) DEV.browser = b.brand + ' ' + b.version;
+      }, function () { /* немає */ });
+    }
+    return Promise.resolve();
+  }
+
+  // ---------------------------------------------------------------- екрани і переходи
+  var current = 'boot';
+  var unlocked = false;
+  function show(name) {
+    var screens = document.querySelectorAll('.screen');
+    for (var i = 0; i < screens.length; i++) screens[i].hidden = screens[i].id !== 'scr-' + name;
+    current = name;
+    window.scrollTo(0, 0);
+  }
+  function enter(name) {
+    var prev = current;
+    if (prev === 'scan' && name !== 'scan') stopScanner();
+    if (prev === 'photo' && name !== 'photo') clearPhoto();
+    show(name);
+    if (name === 'main') renderMain();
+    if (name === 'scan') { renderReads(); renderMode(); startScanner(); }
+    if (name === 'photo') renderPhotoTotal();
+    if (name === 'report') renderReport();
+  }
+  function go(name) {
+    history.pushState({ s: name }, '', '#' + name);
+    enter(name);
+  }
+  window.addEventListener('popstate', function (e) {
+    if (!unlocked) return;
+    var s = (e.state && e.state.s) || 'main';
+    enter(s);
+  });
+
+  // ---------------------------------------------------------------- код запрошення і PIN
+  var entry = { mode: 'invite', len: 6, value: '' };
+  var firstPin = '';
+  var busy = false;
+  var ENTRY_TEXT = {
+    invite: ['Код запрошення', 'Введіть 6 цифр. Для проби підходять будь-які 6 цифр.'],
+    'pin-new': ['Придумайте PIN', '4 цифри. Його треба буде вводити щоразу, коли відкриваєте сторінку.'],
+    'pin-repeat': ['Повторіть PIN', 'Введіть ті самі 4 цифри ще раз.'],
+    pin: ['Введіть PIN', '4 цифри, які ви придумали при першому запуску.']
+  };
+  function buildKeypad() {
+    var kp = $('keypad');
+    var keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', 'del'];
+    keys.forEach(function (k) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      if (k === '') { b.className = 'empty'; b.tabIndex = -1; b.setAttribute('aria-hidden', 'true'); }
+      else if (k === 'del') { b.className = 'del'; b.textContent = '⌫ Стерти'; b.setAttribute('aria-label', 'Стерти цифру'); b.dataset.k = 'del'; }
+      else { b.textContent = k; b.dataset.k = k; }
+      kp.appendChild(b);
+    });
+    kp.addEventListener('click', function (e) {
+      var t = e.target.closest('button');
+      if (t && t.dataset.k) press(t.dataset.k);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (current !== 'code') return;
+      if (/^[0-9]$/.test(e.key)) { press(e.key); e.preventDefault(); }
+      else if (e.key === 'Backspace') { press('del'); e.preventDefault(); }
+    });
+  }
+  function setEntry(mode, errText) {
+    entry.mode = mode;
+    entry.len = mode === 'invite' ? 6 : 4;
+    entry.value = '';
+    $('code-title').textContent = ENTRY_TEXT[mode][0];
+    $('code-hint').textContent = ENTRY_TEXT[mode][1];
+    $('code-err').textContent = errText || '';
+    $('code-forgot').hidden = mode !== 'pin';
+    renderDots();
+    if (current !== 'code') show('code');
+  }
+  function renderDots() {
+    var box = $('code-dots');
+    box.textContent = '';
+    for (var i = 0; i < entry.len; i++) {
+      var d = document.createElement('div');
+      d.className = 'dot' + (i < entry.value.length ? ' filled' : '');
+      if (i < entry.value.length) d.textContent = entry.mode === 'invite' ? entry.value[i] : '●';
+      box.appendChild(d);
+    }
+    box.setAttribute('aria-label', 'Введено цифр: ' + entry.value.length + ' з ' + entry.len);
+  }
+  function press(k) {
+    if (busy) return;
+    unlockAudio();
+    if (k === 'del') entry.value = entry.value.slice(0, -1);
+    else if (entry.value.length < entry.len) entry.value += k;
+    if (entry.value.length) $('code-err').textContent = '';
+    renderDots();
+    if (entry.value.length === entry.len) {
+      busy = true;
+      setTimeout(function () { submitEntry().then(function () { busy = false; }, function (e) { busy = false; $('code-err').textContent = 'Помилка: ' + (e && e.message ? e.message : e); }); }, 150);
+    }
+  }
+  function submitEntry() {
+    var v = entry.value;
+    if (entry.mode === 'invite') { setEntry('pin-new'); return Promise.resolve(); }
+    if (entry.mode === 'pin-new') { firstPin = v; setEntry('pin-repeat'); return Promise.resolve(); }
+    if (entry.mode === 'pin-repeat') {
+      if (v !== firstPin) { firstPin = ''; setEntry('pin-new', 'PIN не збігся. Придумайте його ще раз.'); return Promise.resolve(); }
+      firstPin = '';
+      $('code-hint').textContent = 'Запамʼятовую телефон…';
+      return createMarks(v).then(function () { return readMarks(); }).then(function (m) { marks = m; unlock(); });
+    }
+    // pin
+    return hashPin(mark.salt, v).then(function (h) {
+      if (h === mark.pin) { unlock(); return; }
+      entry.value = '';
+      renderDots();
+      $('code-err').textContent = 'Неправильний PIN. Спробуйте ще раз.';
+    });
+  }
+  function unlock() {
+    unlocked = true;
+    history.replaceState({ s: 'main' }, '', location.pathname + location.search);
+    enter('main');
+    ensureLib().catch(function () { /* покажемо на екрані сканера */ });
+  }
+
+  // ---------------------------------------------------------------- головний екран
+  function renderMain() {
+    var how = openedFrom();
+    var m = mark || pickMark(marks || {});
+    $('main-status').textContent = 'Телефон запамʼятано з ' + (m ? fmtDate(m.first) : '—') + '. Відкрито: ' + OPENED_TEXT[how] + '.';
+    var box = $('main-marks');
+    box.textContent = '';
+    var p = document.createElement('p');
+    p.textContent = 'Позначки на цьому телефоні:';
+    p.style.margin = '2px 0';
+    box.appendChild(p);
+    var ul = document.createElement('ul');
+    [['localStorage', marks && marks.ls], ['cookie', marks && marks.ck], ['IndexedDB', marks && marks.idb]].forEach(function (x) {
+      var li = document.createElement('li');
+      li.textContent = markLine(x[0], x[1]);
+      ul.appendChild(li);
+    });
+    box.appendChild(ul);
+    var p2 = document.createElement('p');
+    p2.style.margin = '2px 0';
+    p2.textContent = 'Постійне сховище: ' + (persisted === null ? 'невідомо' : persisted ? 'так' : 'ні') +
+      (m && m.how ? '. Перший запуск — ' + OPENED_TEXT[m.how] + '.' : '');
+    box.appendChild(p2);
+    $('main-ver').textContent = 'Версія сторінки: ' + APP_VERSION + ' · читач кодів: ' + LIB_NAME + ' ' + LIB_VERSION;
+  }
+
+  // ---------------------------------------------------------------- звук і вібрація
+  var audioCtx = null;
+  function unlockAudio() {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      var b = audioCtx.createBuffer(1, 1, 22050);
+      var s = audioCtx.createBufferSource();
+      s.buffer = b;
+      s.connect(audioCtx.destination);
+      s.start(0);
+    } catch (e) { /* без звуку */ }
+  }
+  function beep() {
+    try {
+      if (!audioCtx) return;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      var t = audioCtx.currentTime;
+      var o = audioCtx.createOscillator();
+      var g = audioCtx.createGain();
+      o.type = 'sine';
+      o.frequency.value = 1250;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.4, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+      o.connect(g);
+      g.connect(audioCtx.destination);
+      o.start(t);
+      o.stop(t + 0.14);
+    } catch (e) { /* */ }
+  }
+  function vibrate() { try { if (navigator.vibrate) navigator.vibrate(60); } catch (e) { /* */ } }
+
+  // ---------------------------------------------------------------- читачі кодів
+  var libPromise = null;
+  function ensureLib() {
+    if (!libPromise) {
+      libPromise = new Promise(function (res, rej) {
+        if (!window.ZXingWASM) { rej(new Error('файл бібліотеки не завантажився')); return; }
+        var t0 = performance.now();
+        var p = window.ZXingWASM.prepareZXingModule({
+          overrides: {
+            locateFile: function (path, prefix) {
+              if (/\.wasm$/.test(path)) return new URL('vendor/zxing-wasm/' + path, document.baseURI).href;
+              return prefix + path;
+            }
+          },
+          fireImmediately: true
+        });
+        withTimeout(Promise.resolve(p), 30000, 'бібліотека').then(function () {
+          session.libLoadMs = Math.round(performance.now() - t0);
+          res();
+        }, rej);
+      });
+      libPromise.catch(function () { libPromise = null; });
+    }
+    return libPromise;
+  }
+
+  var native = { state: 'unknown', detector: null, formats: [] };
+  function initNative() {
+    if (!('BarcodeDetector' in window)) { native.state = 'none'; return Promise.resolve(); }
+    return withTimeout(window.BarcodeDetector.getSupportedFormats(), 4000, 'BarcodeDetector').then(function (sup) {
+      var fm = NATIVE_FORMATS.filter(function (f) { return sup.indexOf(f) >= 0; });
+      if (!fm.length) { native.state = 'noformats'; return; }
+      native.detector = new window.BarcodeDetector({ formats: fm });
+      native.formats = fm;
+      native.state = 'ok';
+    }, function (e) { native.state = 'err'; native.why = e && e.message; });
+  }
+
+  // ---------------------------------------------------------------- сканер
+  var video, canvas, ctx;
+  var sc = { gen: 0, running: false, stream: null, track: null, startAt: 0, lastAt: 0, torchOn: false, wake: null, seen: {}, errors: 0, lastErr: '' };
+  var mode = 'lib';
+
+  function setScanState(t) { $('scan-state').textContent = t; }
+  function showCamMsg(t, retry) {
+    $('cam-msg-text').textContent = t;
+    $('cam-retry').hidden = !retry;
+    $('cam-msg').hidden = false;
+  }
+  function hideCamMsg() { $('cam-msg').hidden = true; }
+
+  function camErrorText(e) {
+    var n = e && e.name;
+    if (n === 'NotAllowedError' || n === 'SecurityError' || n === 'PermissionDeniedError') {
+      if (IS_IOS) {
+        return 'Камеру не дозволено.\n\nЩо натиснути: «Параметри» телефона → «Safari» → «Камера» → «Дозволити» (або «Запитувати»).\n' +
+          'Або в Safari: кнопка «аА» ліворуч від адреси → «Параметри вебсайту» → «Камера» → «Дозволити».\n\n' +
+          'Потім поверніться сюди й натисніть «Спробувати ще раз». Номер можна ввести руками нижче.';
+      }
+      return 'Камеру не дозволено.\n\nЩо натиснути: значок ліворуч від адреси (замок або повзунки) → «Дозволи» → «Камера» → «Дозволити».\n' +
+        'Якщо сторінка відкрита з іконки: утримуйте іконку → «Про застосунок» (ⓘ) → «Дозволи» → «Камера» → «Дозволити».\n\n' +
+        'Потім поверніться сюди й натисніть «Спробувати ще раз». Номер можна ввести руками нижче.';
+    }
+    if (n === 'NotFoundError' || n === 'OverconstrainedError' || n === 'DevicesNotFoundError') return 'Камеру не знайдено. Номер можна ввести руками нижче.';
+    if (n === 'NotReadableError' || n === 'TrackStartError' || n === 'AbortError') return 'Камера зайнята іншою програмою або не запускається. Закрийте інші програми з камерою й натисніть «Спробувати ще раз».';
+    return 'Камера не запустилась: ' + (n || '') + ' ' + (e && e.message ? e.message : '') + '\nНомер можна ввести руками нижче.';
+  }
+
+  function startScanner() {
+    stopScanner();
+    var gen = ++sc.gen;
+    hideCamMsg();
+    unlockAudio();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showCamMsg('Цей браузер не дає сторінці доступу до камери. Спробуйте Safari (iPhone) або Chrome (Android). Номер можна ввести руками нижче.', false);
+      setScanState('');
+      return;
+    }
+    setScanState('Запускаю камеру…');
+    navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    }).then(function (stream) {
+      if (gen !== sc.gen || current !== 'scan') { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      sc.stream = stream;
+      sc.track = stream.getVideoTracks()[0];
+      video.srcObject = stream;
+      var pl = video.play();
+      if (pl && pl.catch) pl.catch(function () { /* autoplay без звуку дозволений */ });
+      return waitVideo(gen).then(function () {
+        if (gen !== sc.gen) return;
+        session.cam = video.videoWidth + '×' + video.videoHeight;
+        setupTorch(gen);
+        requestWake();
+        var ready = mode === 'lib' ? ensureLib() : Promise.resolve();
+        if (mode === 'lib') setScanState('Готую читач кодів…');
+        return ready.then(function () {
+          if (gen !== sc.gen) return;
+          sc.running = true;
+          sc.startAt = sc.lastAt = performance.now();
+          sc.seen = {};
+          session.runs++;
+          saveSession();
+          setScanState('Наведіть камеру на штрихкод. Тримайте телефон за 15–20 см від етикетки.');
+          loop(gen);
+        }, function (e) {
+          if (gen !== sc.gen) return;
+          setScanState('Не вдалося завантажити читач кодів: ' + (e && e.message ? e.message : e) + (native.state === 'ok' ? '. Перемкніть на «Вбудоване».' : ''));
+        });
+      });
+    }).catch(function (e) {
+      if (gen !== sc.gen) return;
+      session.camErrors.push((e && e.name ? e.name : 'Error') + (e && e.message ? ': ' + e.message : ''));
+      if (session.camErrors.length > 10) session.camErrors.shift();
+      saveSession();
+      showCamMsg(camErrorText(e), true);
+      setScanState('');
+    });
+  }
+
+  function waitVideo(gen) {
+    return new Promise(function (res) {
+      var t0 = performance.now();
+      (function check() {
+        if (gen !== sc.gen) { res(); return; }
+        if (video.readyState >= 2 && video.videoWidth > 0) { res(); return; }
+        if (performance.now() - t0 > 8000) { res(); return; }
+        setTimeout(check, 50);
+      })();
+    });
+  }
+
+  function stopScanner() {
+    sc.running = false;
+    sc.gen++;
+    if (sc.stream) sc.stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* */ } });
+    sc.stream = null;
+    sc.track = null;
+    sc.torchOn = false;
+    if (video) { try { video.pause(); } catch (e) { /* */ } video.srcObject = null; }
+    var tb = $('btn-torch');
+    tb.hidden = true;
+    tb.classList.remove('on');
+    tb.textContent = 'Ліхтарик';
+    releaseWake();
+    saveSession();
+  }
+
+  function nextFrame() {
+    return new Promise(function (res) {
+      var done = false;
+      function fin() { if (!done) { done = true; res(); } }
+      if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(fin);
+      else requestAnimationFrame(fin);
+      setTimeout(fin, 250);
+    });
+  }
+
+  function grabFrame() {
+    var vw = video.videoWidth, vh = video.videoHeight;
+    var k = Math.min(1, 1920 / Math.max(vw, vh));
+    var w = Math.round(vw * k), h = Math.round(vh * k);
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    ctx.drawImage(video, 0, 0, w, h);
+    return ctx.getImageData(0, 0, w, h);
+  }
+  function decodeLib() {
+    return ensureLib().then(function () {
+      return window.ZXingWASM.readBarcodes(grabFrame(), LIB_OPTIONS);
+    }).then(function (out) {
+      return out.filter(function (r) { return r.isValid && r.text; }).map(function (r) {
+        return { text: r.text, type: typeLabel(r.format, r.symbology) };
+      });
+    });
+  }
+  function decodeNative() {
+    return native.detector.detect(video).then(function (out) {
+      return out.filter(function (b) { return b.rawValue; }).map(function (b) { return { text: b.rawValue, type: typeLabel(b.format) }; });
+    });
+  }
+
+  function loop(gen) {
+    if (!sc.running || gen !== sc.gen) return;
+    var ready = video.readyState >= 2 && video.videoWidth > 0;
+    var m = mode;
+    var t0 = performance.now();
+    var p = !ready ? Promise.resolve([]) : (m === 'native' && native.detector ? decodeNative() : decodeLib());
+    p.then(function (found) {
+      if (!sc.running || gen !== sc.gen) return;
+      if (ready) {
+        var st = session.frames[m === 'native' && native.detector ? 'native' : 'lib'];
+        st.n++;
+        st.ms += performance.now() - t0;
+      }
+      sc.errRun = 0;
+      for (var i = 0; i < found.length; i++) handleCode(found[i].text, found[i].type, m === 'native' && native.detector ? 'native' : 'lib');
+    }, function (e) {
+      sc.errors++;
+      sc.lastErr = e && e.message ? e.message : String(e);
+      session.decodeErrors = (session.decodeErrors || 0) + 1;
+      session.lastDecodeError = sc.lastErr;
+      sc.errRun = (sc.errRun || 0) + 1;
+      if (sc.errRun === 5) setScanState('Читач кодів дає помилку: ' + sc.lastErr);
+    }).then(function () {
+      if (!sc.running || gen !== sc.gen) return;
+      return nextFrame().then(function () { loop(gen); });
+    });
+  }
+
+  var toastTimer = null, hitTimer = null;
+  function showToast(text, kind) {
+    var t = $('toast');
+    t.textContent = text;
+    t.className = 'toast ' + (kind || '');
+    t.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.hidden = true; }, 1300);
+  }
+  function flashHit() {
+    var f = $('frame');
+    f.classList.add('hit');
+    clearTimeout(hitTimer);
+    hitTimer = setTimeout(function () { f.classList.remove('hit'); }, 450);
+  }
+  function tail(v) { v = visible(v); return v.length > 18 ? '…' + v.slice(-16) : v; }
+
+  // method: 'lib' | 'native' | 'manual'
+  function handleCode(raw, type, method) {
+    var value = String(raw);
+    if (!value) return false;
+    var now = performance.now();
+    var exists = session.reads.some(function (r) { return r.v === value && (r.m === method || method === 'manual'); });
+    if (method === 'manual') {
+      if (exists) { showToast('Вже є: ' + tail(value), 'dup'); return false; }
+    } else {
+      // той самий код, що досі в кадрі, не показуємо як «вже є» щокадру
+      var key = method + '|' + value;
+      var prevSeen = sc.seen[key];
+      sc.seen[key] = now;
+      if (exists) {
+        if (prevSeen === undefined || now - prevSeen > 1500) showToast('Вже є: ' + tail(value), 'dup');
+        return false;
+      }
+    }
+    var row = { v: value, t: type, m: method, ms: null, at: Date.now() };
+    if (method !== 'manual') {
+      row.ms = Math.round(now - sc.lastAt);
+      sc.lastAt = now;
+    }
+    session.reads.push(row);
+    saveSession();
+    renderReads();
+    beep();
+    vibrate();
+    flashHit();
+    showToast('✓ ' + tail(value), 'ok');
+    return true;
+  }
+
+  function rowMeta(r) {
+    if (r.m === 'manual') return 'введено вручну · ' + fmtClock(r.at);
+    return r.t + ' · ' + (r.ms === null ? '—' : r.ms + ' мс') + ' · ' + METHOD_LABEL[r.m] + ' · ' + fmtClock(r.at);
+  }
+
+  function renderReads() {
+    var ol = $('reads');
+    ol.textContent = '';
+    var list = session.reads;
+    for (var i = list.length - 1; i >= 0; i--) {
+      var r = list[i];
+      var li = document.createElement('li');
+      var v = document.createElement('div');
+      v.className = 'val';
+      var num = document.createElement('span');
+      num.className = 'num';
+      num.textContent = (i + 1) + '.';
+      v.appendChild(num);
+      v.appendChild(document.createTextNode(visible(r.v)));
+      var meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = rowMeta(r);
+      li.appendChild(v);
+      li.appendChild(meta);
+      ol.appendChild(li);
+    }
+    $('scan-count').textContent = 'Зчитано: ' + list.length;
+    var lr = $('last-read');
+    if (list.length) {
+      var last = list[list.length - 1];
+      lr.textContent = 'Останнє: ';
+      var b = document.createElement('b');
+      b.textContent = visible(last.v);
+      lr.appendChild(b);
+      lr.appendChild(document.createTextNode(' · ' + rowMeta(last)));
+      lr.hidden = false;
+    } else lr.hidden = true;
+  }
+
+  function renderMode() {
+    var box = $('mode-box');
+    var note = $('mode-note');
+    if (native.state === 'ok') {
+      box.hidden = false;
+      note.hidden = true;
+      var bs = $('mode-seg').querySelectorAll('button');
+      for (var i = 0; i < bs.length; i++) bs[i].classList.toggle('active', bs[i].dataset.mode === mode);
+    } else {
+      box.hidden = true;
+      note.hidden = false;
+      note.textContent = 'Спосіб читання: бібліотека (вбудованого читання кодів у цьому браузері немає).';
+    }
+  }
+  function setMode(m) {
+    if (m === mode) return;
+    if (m === 'native' && native.state !== 'ok') return;
+    mode = m;
+    session.mode = m;
+    saveSession();
+    renderMode();
+    sc.seen = {};
+    if (sc.running) sc.lastAt = performance.now();
+    if (m === 'lib') {
+      ensureLib().catch(function (e) { setScanState('Не вдалося завантажити читач кодів: ' + (e && e.message ? e.message : e)); });
+    }
+    setScanState(m === 'native' ? 'Читає вбудований засіб телефона.' : 'Читає бібліотека.');
+  }
+
+  function setupTorch(gen) {
+    var tb = $('btn-torch');
+    function check() {
+      if (gen !== sc.gen || !sc.track) return;
+      try {
+        var caps = sc.track.getCapabilities ? sc.track.getCapabilities() : {};
+        if (caps && caps.torch) { tb.hidden = false; session.torch = 'є'; }
+        else if (session.torch !== 'є') session.torch = 'немає';
+      } catch (e) { if (session.torch !== 'є') session.torch = 'немає'; }
+    }
+    check();
+    setTimeout(check, 800);
+  }
+  function toggleTorch() {
+    var t = sc.track;
+    if (!t) return;
+    var want = !sc.torchOn;
+    t.applyConstraints({ advanced: [{ torch: want }] }).then(function () {
+      sc.torchOn = want;
+      var tb = $('btn-torch');
+      tb.classList.toggle('on', want);
+      tb.textContent = want ? 'Ліхтарик: увімкнено' : 'Ліхтарик';
+    }, function (e) { setScanState('Ліхтарик не вмикається: ' + (e && e.message ? e.message : e)); });
+  }
+
+  function requestWake() {
+    try {
+      if (navigator.wakeLock && navigator.wakeLock.request) {
+        navigator.wakeLock.request('screen').then(function (w) { sc.wake = w; }, function () { /* */ });
+      }
+    } catch (e) { /* */ }
+  }
+  function releaseWake() {
+    try { if (sc.wake) sc.wake.release(); } catch (e) { /* */ }
+    sc.wake = null;
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      if (current === 'scan') stopScanner();
+      saveSession();
+    } else if (current === 'scan' && unlocked) {
+      startScanner();
+    }
+  });
+  window.addEventListener('pagehide', saveSession);
+
+  // ---------------------------------------------------------------- фото
+  var previewUrl = null;
+  function clearPhoto() {
+    if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
+    var img = $('photo-preview');
+    img.removeAttribute('src');
+    $('photo-result').hidden = true;
+    $('photo-stats').textContent = '';
+    $('photo-state').textContent = '';
+    try { $('photo-input').value = ''; } catch (e) { /* */ }
+  }
+  function onPhoto() {
+    var input = $('photo-input');
+    var f = input.files && input.files[0];
+    if (!f) return;
+    clearPhoto();
+    $('photo-state').textContent = 'Стискаю…';
+    var t0 = performance.now();
+    var srcUrl = URL.createObjectURL(f);
+    var img = new Image();
+    img.decoding = 'async';
+    var loaded = new Promise(function (res, rej) {
+      img.onload = function () { res(); };
+      img.onerror = function () { rej(new Error('не вдалося відкрити фото (формат ' + (f.type || 'невідомий') + ')')); };
+    });
+    img.src = srcUrl;
+    loaded.then(function () {
+      var w0 = img.naturalWidth, h0 = img.naturalHeight;
+      var k = Math.min(1, 1600 / Math.max(w0, h0));
+      var w1 = Math.max(1, Math.round(w0 * k)), h1 = Math.max(1, Math.round(h0 * k));
+      var c = document.createElement('canvas');
+      c.width = w1;
+      c.height = h1;
+      var cx = c.getContext('2d');
+      cx.imageSmoothingEnabled = true;
+      cx.imageSmoothingQuality = 'high';
+      cx.drawImage(img, 0, 0, w1, h1);
+      return new Promise(function (res, rej) {
+        c.toBlob(function (b) {
+          c.width = 0; c.height = 0;
+          if (b) res({ blob: b, w0: w0, h0: h0, w1: w1, h1: h1 }); else rej(new Error('не вдалося стиснути'));
+        }, 'image/jpeg', 0.8);
+      });
+    }).then(function (r) {
+      var ms = Math.round(performance.now() - t0);
+      var rec = { before: f.size, after: r.blob.size, w0: r.w0, h0: r.h0, w1: r.w1, h1: r.h1, ms: ms, type: f.type || '?' };
+      session.photos.push(rec);
+      saveSession();
+      $('photo-state').textContent = '';
+      $('photo-stats').textContent = 'До стискання: ' + fmtBytes(rec.before) + ' (' + rec.w0 + '×' + rec.h0 + ')\n' +
+        'Після: ' + fmtBytes(rec.after) + ' (' + rec.w1 + '×' + rec.h1 + ', JPEG)\n' +
+        'Стискання тривало: ' + rec.ms + ' мс';
+      $('photo-stats').style.whiteSpace = 'pre-line';
+      previewUrl = URL.createObjectURL(r.blob);
+      $('photo-preview').src = previewUrl;
+      $('photo-result').hidden = false;
+      renderPhotoTotal();
+    }).catch(function (e) {
+      $('photo-state').textContent = 'Помилка: ' + (e && e.message ? e.message : e);
+    }).then(function () {
+      URL.revokeObjectURL(srcUrl);
+      img.removeAttribute('src');
+      try { input.value = ''; } catch (e) { /* */ }
+    });
+  }
+  function renderPhotoTotal() {
+    var n = session.photos.length;
+    $('photo-total').textContent = n ? 'Зроблено знімків за пробу: ' + n + '. Підсумок буде у звіті.' : '';
+  }
+
+  // ---------------------------------------------------------------- звіт
+  function avg(st) { return st.n ? Math.round(st.ms / st.n) : null; }
+  function nativeText() {
+    if (native.state === 'ok') return 'є (' + native.formats.length + ' з ' + NATIVE_FORMATS.length + ' потрібних форматів)';
+    if (native.state === 'none') return 'немає';
+    if (native.state === 'noformats') return 'є, але без потрібних форматів';
+    if (native.state === 'err') return 'помилка: ' + (native.why || '');
+    return 'невідомо';
+  }
+  function buildReport() {
+    var L = [];
+    var m = mark || pickMark(marks || {});
+    var model = ($('model-input').value || '').trim();
+    L.push('Проба сканера — звіт');
+    L.push('Версія сторінки: ' + APP_VERSION + ' · складено ' + fmtDate(new Date().toISOString()));
+    L.push('Телефон: ' + (model || DEV.model || 'модель не вказано') + (model && DEV.model && model !== DEV.model ? ' (браузер каже: ' + DEV.model + ')' : '') +
+      ' · ' + (DEV.os || '?') + ' · ' + (DEV.browser || '?'));
+    L.push('Екран: ' + screen.width + '×' + screen.height + ', щільність ×' + (window.devicePixelRatio || 1));
+    L.push('Відкрито зараз: ' + OPENED_TEXT[openedFrom()]);
+    L.push('Перший запуск: ' + (m ? fmtDate(m.first) + (m.how ? ' (' + OPENED_TEXT[m.how] + ')' : '') : '—'));
+    L.push('Позначки:');
+    L.push('  ' + markLine('localStorage', marks && marks.ls));
+    L.push('  ' + markLine('cookie', marks && marks.ck));
+    L.push('  ' + markLine('IndexedDB', marks && marks.idb));
+    L.push('Постійне сховище: ' + (persisted === null ? 'невідомо' : persisted ? 'так' : 'ні'));
+    L.push('Вбудоване читання кодів: ' + nativeText());
+    L.push('Бібліотека: ' + LIB_NAME + ' ' + LIB_VERSION + (session.libLoadMs !== null ? ', завантаження ' + session.libLoadMs + ' мс' : ''));
+    L.push('Спосіб читання зараз: ' + METHOD_LABEL[mode]);
+    L.push('Камера: ' + (session.cam || 'не запускалась') + ' · ліхтарик: ' + (session.torch || '—'));
+    if (session.camErrors.length) L.push('Помилки камери: ' + session.camErrors.join('; '));
+    L.push('Запусків сканера: ' + session.runs);
+    if (session.decodeErrors) L.push('Помилок читача: ' + session.decodeErrors + ' (остання: ' + session.lastDecodeError + ')');
+    var fl = session.frames.lib, fn = session.frames.native;
+    L.push('Кадрів розібрано: бібліотека — ' + fl.n + (fl.n ? ', у середньому ' + avg(fl) + ' мс' : '') +
+      '; вбудоване — ' + fn.n + (fn.n ? ', у середньому ' + avg(fn) + ' мс' : ''));
+    var cnt = { lib: 0, native: 0, manual: 0 };
+    session.reads.forEach(function (r) { cnt[r.m] = (cnt[r.m] || 0) + 1; });
+    L.push('Зчитано: ' + session.reads.length + ' (бібліотека ' + cnt.lib + ', вбудоване ' + cnt.native + ', вручну ' + cnt.manual + ')');
+    if (session.reads.length) {
+      L.push('Зчитування (значення · тип · мс від попереднього або від запуску · спосіб · час):');
+      session.reads.forEach(function (r, i) {
+        L.push((i + 1) + '. ' + visible(r.v) + ' · ' + rowMeta(r));
+      });
+    }
+    L.push('Фото: ' + session.photos.length);
+    session.photos.forEach(function (p, i) {
+      L.push((i + 1) + '. ' + fmtBytes(p.before) + ' → ' + fmtBytes(p.after) + ' · ' + p.w0 + '×' + p.h0 + ' → ' + p.w1 + '×' + p.h1 + ' · ' + p.ms + ' мс · ' + p.type);
+    });
+    if (session.photos.length) {
+      var sb = 0, sa = 0, sm = 0;
+      session.photos.forEach(function (p) { sb += p.before; sa += p.after; sm += p.ms; });
+      var n = session.photos.length;
+      L.push('У середньому: ' + fmtBytes(Math.round(sb / n)) + ' → ' + fmtBytes(Math.round(sa / n)) + ', ' + Math.round(sm / n) + ' мс');
+    }
+    L.push('Що було не так:');
+    var note = ($('note-input').value || '').trim();
+    L.push(note || '—');
+    L.push('Рядок браузера: ' + UA);
+    return L.join('\n');
+  }
+  function renderReport() {
+    $('model-input').value = session.model || DEV.model || '';
+    $('note-input').value = session.note || '';
+    $('copy-msg').textContent = '';
+    $('report-text').value = buildReport();
+  }
+  function copyReport() {
+    session.model = ($('model-input').value || '').trim();
+    session.note = $('note-input').value || '';
+    saveSession();
+    var text = buildReport();
+    var ta = $('report-text');
+    ta.value = text;
+    var msg = $('copy-msg');
+    function fallback() {
+      var ok = false;
+      $('report-details').open = true;
+      try {
+        ta.removeAttribute('readonly');
+        ta.focus();
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        ok = document.execCommand('copy');
+      } catch (e) { ok = false; }
+      ta.setAttribute('readonly', '');
+      if (ok) { msg.className = 'ok'; msg.textContent = 'Скопійовано. Вставте в повідомлення.'; }
+      else {
+        msg.className = 'err';
+        msg.textContent = 'Не вдалося скопіювати самостійно. Утримуйте палець на тексті нижче → «Виділити все» → «Скопіювати».';
+      }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        msg.className = 'ok';
+        msg.textContent = 'Скопійовано. Вставте в повідомлення.';
+      }, fallback);
+    } else fallback();
+  }
+
+  // ---------------------------------------------------------------- підтвердження і «почати заново»
+  function confirmBox(text, yesText) {
+    return new Promise(function (res) {
+      $('modal-text').textContent = text;
+      $('modal-yes').textContent = yesText;
+      $('modal').hidden = false;
+      function done(v) {
+        $('modal').hidden = true;
+        $('modal-yes').onclick = null;
+        $('modal-no').onclick = null;
+        res(v);
+      }
+      $('modal-yes').onclick = function () { done(true); };
+      $('modal-no').onclick = function () { done(false); };
+    });
+  }
+  function resetAll() {
+    stopScanner();
+    clearPhoto();
+    wiping = true;
+    session = defaultSession();
+    try {
+      var ks = [];
+      for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (k && k.indexOf(KEY) === 0) ks.push(k); }
+      ks.forEach(function (k) { localStorage.removeItem(k); });
+    } catch (e) { /* */ }
+    try { sessionStorage.clear(); } catch (e) { /* */ }
+    cookieDel();
+    var jobs = [idbDelete()];
+    if (window.caches && caches.keys) {
+      jobs.push(caches.keys().then(function (ks) {
+        return Promise.all(ks.filter(function (k) { return k.indexOf(KEY) === 0; }).map(function (k) { return caches.delete(k); }));
+      }).catch(function () { /* */ }));
+    }
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+      var scope = location.origin + BASE_PATH;
+      jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) {
+        return Promise.all(rs.filter(function (r) { return r.scope.indexOf(scope) === 0; }).map(function (r) { return r.unregister(); }));
+      }).catch(function () { /* */ }));
+    }
+    return Promise.all(jobs).then(function () {
+      location.replace(location.pathname + location.search);
+    });
+  }
+  function askReset() {
+    confirmBox('Стерти все на цьому телефоні?\nПозначки, PIN, список зчитувань і підсумок фото зникнуть, і проба почнеться з коду запрошення.', 'Так, стерти все').then(function (yes) {
+      if (yes) resetAll();
+    });
+  }
+
+  // ---------------------------------------------------------------- старт
+  function bind() {
+    document.addEventListener('pointerdown', unlockAudio, { once: true, passive: true });
+    document.querySelectorAll('[data-go]').forEach(function (b) {
+      b.addEventListener('click', function () { go(b.dataset.go); });
+    });
+    document.querySelectorAll('[data-back]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        if (history.state && history.state.s && history.state.s !== 'main') history.back();
+        else enter('main');
+      });
+    });
+    $('cam-retry').addEventListener('click', startScanner);
+    $('btn-torch').addEventListener('click', toggleTorch);
+    $('mode-seg').addEventListener('click', function (e) {
+      var b = e.target.closest('button');
+      if (b) setMode(b.dataset.mode);
+    });
+    $('manual-form').addEventListener('submit', function (e) {
+      e.preventDefault();
+      var inp = $('manual-input');
+      var v = (inp.value || '').replace(/\s+/g, '');
+      if (!v) return;
+      if (handleCode(v, '—', 'manual')) inp.value = '';
+    });
+    $('photo-input').addEventListener('change', onPhoto);
+    $('btn-photo-clear').addEventListener('click', clearPhoto);
+    $('btn-copy').addEventListener('click', copyReport);
+    $('model-input').addEventListener('input', function () { session.model = this.value.trim(); saveSession(); });
+    $('note-input').addEventListener('input', function () { session.note = this.value; saveSession(); });
+    $('btn-clear-reads').addEventListener('click', function () {
+      confirmBox('Очистити список зчитувань?\nПозначки й PIN лишаться.', 'Так, очистити').then(function (yes) {
+        if (!yes) return;
+        session.reads = [];
+        session.frames = defaultSession().frames;
+        session.runs = 0;
+        saveSession();
+        renderReport();
+      });
+    });
+    $('btn-reset').addEventListener('click', askReset);
+    $('code-forgot').addEventListener('click', askReset);
+  }
+
+  function registerSW() {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('sw.js', { scope: './' }).catch(function () { /* без офлайну */ });
+  }
+
+  function boot() {
+    video = $('video');
+    canvas = document.createElement('canvas');
+    ctx = canvas.getContext('2d', { willReadFrequently: true });
+    buildKeypad();
+    bind();
+    session = loadSession();
+    mode = session.mode === 'native' ? 'native' : 'lib';
+    Promise.all([detectDevice(), initNative(), checkPersisted(), readMarks()]).then(function (r) {
+      marks = r[3];
+      if (mode === 'native' && native.state !== 'ok') mode = 'lib';
+      mark = pickMark(marks);
+      if (!mark) { firstPin = ''; setEntry('invite'); }
+      else setEntry('pin');
+      registerSW();
+    }).catch(function (e) {
+      $('boot-msg').textContent = 'Помилка запуску: ' + (e && e.message ? e.message : e);
+    });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+
+  // для автоматичної перевірки на тестових зображеннях (нічого не надсилає)
+  window.__proba = {
+    version: APP_VERSION,
+    decodeImageData: function (img) {
+      return ensureLib().then(function () { return window.ZXingWASM.readBarcodes(img, LIB_OPTIONS); }).then(function (out) {
+        return out.filter(function (r) { return r.isValid; }).map(function (r) { return { text: r.text, type: typeLabel(r.format, r.symbology) }; });
+      });
+    },
+    readMarks: readMarks,
+    nativeState: function () { return native.state; }
+  };
+})();
