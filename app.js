@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '1'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js
+  var APP_VERSION = '2'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
@@ -355,15 +355,31 @@
       else { b.textContent = k; b.dataset.k = k; }
       kp.appendChild(b);
     });
-    // Натискання — у мить дотику: швидкі повторні дотики до тієї ж цифри (1111) iPhone інакше може злити в один «клік».
-    // «click» лишається для клавіатури й читачів екрана, але після дотику ігнорується.
+    // Натискання — у мить дотику. Швидкі повторні дотики до тієї ж цифри (1111) iPhone сприймає як подвійний дотик
+    // і частину з них ковтає; touchstart із preventDefault забирає цей дотик у системних жестів.
+    // Миша — через pointerdown; «click» лишається для клавіатури й читачів екрана, але після дотику ігнорується.
     var lastPointer = 0;
-    kp.addEventListener('pointerdown', function (e) {
-      var t = e.target.closest('button');
-      if (!t || !t.dataset.k) return;
+    function keyOf(target) {
+      var t = target && target.closest ? target.closest('button') : null;
+      return t && t.dataset.k ? t.dataset.k : null;
+    }
+    kp.addEventListener('touchstart', function (e) {
+      var k = keyOf(e.target);
+      if (!k) return;
       e.preventDefault();
       lastPointer = Date.now();
-      press(t.dataset.k);
+      var b = e.target.closest('button');
+      b.classList.add('pressed'); // :active після preventDefault на iPhone не спрацьовує — підсвічуємо самі
+      setTimeout(function () { b.classList.remove('pressed'); }, 140);
+      press(k);
+    }, { passive: false });
+    kp.addEventListener('pointerdown', function (e) {
+      if (e.pointerType === 'touch') return; // дотики обробляє touchstart
+      var k = keyOf(e.target);
+      if (!k) return;
+      e.preventDefault();
+      lastPointer = Date.now();
+      press(k);
     });
     kp.addEventListener('click', function (e) {
       if (Date.now() - lastPointer < 800) return;

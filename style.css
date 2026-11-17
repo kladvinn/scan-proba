@@ -129,6 +129,7 @@ button:active, .big:active, .mid:active { filter: brightness(0.92); }
   font-weight: 600;
 }
 .keypad button.del { font-size: 20px; }
+.keypad button.pressed { filter: brightness(0.85); }
 .keypad .empty { visibility: hidden; }
 
 /* верхня смуга з «Назад» */
