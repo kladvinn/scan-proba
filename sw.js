@@ -5,11 +5,11 @@
 // - файли з номером версії в адресі (app.js?v=1, style.css?v=1), бібліотека, значки, тестові коди:
 //   спершу збережена копія. Нова версія сторінки посилається на нові адреси (?v=2), тож стара сторінка
 //   завжди отримує свої старі файли, а нова — нові: версії не змішуються.
-var CACHE = 'scan-proba-v8';
+var CACHE = 'scan-proba-v9';
 var SHELL = [
   './',
-  'style.css?v=6',
-  'app.js?v=6',
+  'style.css?v=7',
+  'app.js?v=7',
   'manifest.webmanifest',
   'vendor/zxing-wasm/zxing-reader.iife.js',
   'vendor/zxing-wasm/zxing_reader.wasm',
@@ -73,6 +73,8 @@ self.addEventListener('fetch', function (e) {
   var req = e.request;
   var url = new URL(req.url);
   if (req.method !== 'GET' || url.origin !== self.location.origin) return;
+  // номер опублікованої версії — лише з мережі: збережений новіший номер без мережі давав би марне перезавантаження
+  if (/\/version\.json$/.test(url.pathname)) return;
 
   if (req.mode === 'navigate') {
     e.respondWith(networkFirst(req, './', 3000));

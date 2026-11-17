@@ -1,7 +1,7 @@
 'use strict';
 (function () {
   // ---------------------------------------------------------------- сталі
-  var APP_VERSION = '6'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
+  var APP_VERSION = '7'; // змінюючи app.js чи style.css, підняти і цей номер, і ?v= у index.html та sw.js, і число у version.json
   var LIB_NAME = 'zxing-wasm';
   var LIB_VERSION = '3.1.6';
   var KEY = 'scan-proba';
@@ -309,6 +309,7 @@
     window.scrollTo(0, 0);
   }
   function enter(name) {
+    if (reloading) return; // сторінка вже перезавантажується на нову версію — нічого не відкривати
     var prev = current;
     if (prev === 'scan' && name !== 'scan') stopScanner();
     if (prev === 'photo' && name !== 'photo') clearPhoto();
@@ -329,8 +330,13 @@
   // поверненні на сторінку вона питає version.json (повз кеші). Якщо там новіша версія — перезавантажується,
   // але лише там, де нічого не губиться: не під час сканування чи фото і не посеред набору коду.
   // Позначки й список зчитувань лежать у сховищах телефона, тож перезавантаження їх не чіпає.
+  // Перед перезавантаженням сторінка сама забирає нову index.html і перевіряє в ній номер версії: так нова
+  // версія лягає в офлайн-копію, і перезавантаження не відкриє стару навіть на слабкому звʼязку.
   var updateTarget = null;
   var lastUpdateCheck = 0;
+  var reloading = false;   // перезавантаження вже йде
+  var updateBusy = false;  // нова index.html ще завантажується
+  var RELOAD_KEY = KEY + '.reloaded-for';
   function checkForUpdate() {
     var now = Date.now();
     if (now - lastUpdateCheck < 5000) return;
@@ -343,17 +349,41 @@
       applyUpdate();
     }, function () { /* без мережі — лишаємось на збереженій версії */ });
   }
+  // чи можна перезавантажити зараз, нічого не загубивши
+  function canReloadNow() {
+    if (!updateTarget || wiping || reloading) return false;
+    if (current === 'scan' || current === 'photo') return false;
+    if (current === 'code') {
+      if (entry.mode === 'pin-repeat') return false;          // перший PIN уже набрано
+      if (entry.mode === 'pin-new' && !pinOnly) return false; // код запрошення вже набрано
+      // у «Введіть PIN» набрані цифри не шкода: після перезавантаження буде той самий екран
+      if (entry.mode !== 'pin' && entry.value.length) return false;
+    }
+    return true;
+  }
+  function readReloadMark() {
+    try { var g = JSON.parse(sessionStorage.getItem(RELOAD_KEY) || 'null'); return g && typeof g === 'object' ? g : null; } catch (e) { return null; }
+  }
   function applyUpdate() {
-    if (!updateTarget || wiping) return;
-    if (current === 'scan' || current === 'photo') return;
-    if (current === 'code' && entry.value.length) return;
-    // на слабкому звʼязку сторінка може знову прийти зі старої копії — не крутитись у петлі
-    var tried = null;
-    try { tried = sessionStorage.getItem(KEY + '.reloaded-for'); } catch (e) { /* */ }
-    if (tried === String(updateTarget)) return;
-    try { sessionStorage.setItem(KEY + '.reloaded-for', String(updateTarget)); } catch (e) { /* */ }
-    saveSession();
-    location.reload();
+    if (updateBusy || !canReloadNow()) return;
+    // не крутитись у петлі: на одну версію — не частіше ніж раз на хвилину і не більше трьох разів за сеанс
+    var g = readReloadMark();
+    var same = g && g.v === updateTarget;
+    if (same && (g.n >= 3 || Date.now() - g.t < 60000)) return;
+    var target = updateTarget;
+    updateBusy = true;
+    fetch('./', { cache: 'no-store' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
+      updateBusy = false;
+      // нова index.html ще не доїхала (або прийшла стара копія) — спробуємо при наступному поверненні
+      if (!new RegExp('app\\.js\\?v=' + target + '\\b').test(html)) return;
+      if (!canReloadNow() || updateTarget !== target) return;
+      try { sessionStorage.setItem(RELOAD_KEY, JSON.stringify({ v: target, t: Date.now(), n: (same ? (g.n || 0) : 0) + 1 })); } catch (e) { /* */ }
+      reloading = true;
+      saveSession();
+      show('boot');
+      $('boot-msg').textContent = 'Оновлюю сторінку…';
+      location.reload();
+    }, function () { updateBusy = false; /* без мережі — лишаємось на збереженій версії */ });
   }
   function go(name) {
     history.pushState({ s: name }, '', '#' + name);
